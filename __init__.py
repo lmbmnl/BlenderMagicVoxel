@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-# VoxelDraw - original add-on by Sreeraj R (2020, MIT).
-# Rewritten for Blender 5.x: sidebar workflow (Start Voxel / Clear / Confirm).
+# BlenderMagicVoxel by lmbmnl - https://github.com/lmbmnl/BlenderMagicVoxel
+# MagicaVoxel-style voxel editor for Blender 5.x (sidebar: Start Voxel / Clear / Confirm).
+# Inspired by VoxelDraw by Sreeraj R (2020, MIT): https://github.com/theunnecessarythings/VoxelDraw
 #
 # Data model: the drawing is a dict {integer grid cell: palette index 1..255}
 # stored on the object (custom props "_vd_*"), MagicaVoxel style. The mesh is

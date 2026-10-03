@@ -7,14 +7,14 @@ tagline = "MagicaVoxel-style voxel drawing with palette and brushes"
 maintainer = "Marclo"
 type = "add-on"
 
-website = "https://github.com/theunnecessarythings/VoxelDraw"
+website = "https://github.com/lmbmnl/BlenderMagicVoxel"
 tags = ["3D View", "Mesh", "Modeling"]
 
 blender_version_min = "5.0.0"
 
-# Original add-on by Sreeraj R (MIT). Keep the original copyright notice.
+# Inspired by VoxelDraw by Sreeraj R (MIT): keep its copyright notice.
 license = ["SPDX:MIT"]
-copyright = ["2020 Sreeraj R"]
+copyright = ["2026 lmbmnl", "2020 Sreeraj R"]
 
 [build]
-paths_exclude_pattern = ["__pycache__/", "test_*.py"]
+paths_exclude_pattern = ["__pycache__/", "test_*.py", "README.md", ".gitignore"]
