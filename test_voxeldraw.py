@@ -205,6 +205,91 @@ assert op._brush_cells(BS, 'ERASE', *ray) == [(1, 1, 1)]
 op.stroke = BS.tentacle = False
 assert op._brush_cells(BS, 'ERASE', *ray) == [(1, 1, 1)]  # hover after the stroke: the one behind
 
+# --- proportional editing: same falloffs as Blender's own transform
+def native_falloff(kind, R=10.0):
+    me = bpy.data.meshes.new("pe")
+    me.from_pydata([(x * 0.25, 0, 0) for x in range(46)], [], [])
+    ob = bpy.data.objects.new("pe", me)
+    bpy.context.collection.objects.link(ob)
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = ob
+    ob.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(me)
+    for v in bm.verts:
+        v.select = v.index == 0
+    bm.select_flush(True)
+    bmesh.update_edit_mesh(me)
+    bpy.ops.transform.translate(value=(0, 0, 1), use_proportional_edit=True,
+                                proportional_edit_falloff=kind, proportional_size=R)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    out = [(v.co.x, v.co.z) for v in me.vertices]
+    bpy.data.objects.remove(ob)
+    bpy.data.meshes.remove(me)
+    return out
+
+
+for kind in vd.FALLOFF:
+    for x, z in native_falloff(kind):
+        ours = vd.falloff_weight(kind, 1 - x / 10) if x <= 10 else 0.0
+        assert abs(z - ours) < 1e-5, (kind, x, z, ours)
+assert 0 <= vd.falloff_weight('RANDOM', 0.5, (3, 4, 5), 1) <= 0.5
+assert vd.falloff_weight('RANDOM', 0.5, (3, 4, 5), 1) == vd.falloff_weight('RANDOM', 0.5, (3, 4, 5), 1)
+
+row = {(x, 0, 0): 1 for x in range(8)}
+w = vd.proportional_weights(row, {(0, 0, 0)}, 4, 'LINEAR')
+assert {c: round(v, 6) for c, v in w.items()} == {(1, 0, 0): 0.75, (2, 0, 0): 0.5, (3, 0, 0): 0.25}
+gap = {(0, 0, 0): 1, (2, 0, 0): 1}  # not touching
+assert (2, 0, 0) in vd.proportional_weights(gap, {(0, 0, 0)}, 3, 'LINEAR')
+assert vd.proportional_weights(gap, {(0, 0, 0)}, 3, 'LINEAR', connected=True) == {}
+bent = {(0, 0, 0): 1, (0, 1, 0): 1, (1, 1, 0): 1, (2, 1, 0): 1, (2, 0, 0): 1}  # U shape
+wc = vd.proportional_weights(bent, {(0, 0, 0)}, 5, 'LINEAR', connected=True)
+assert round(wc[(2, 0, 0)], 6) == round(1 - 4 / 5, 6)  # 4 steps round the U, not 2 across
+deep = {(0, 0, 0): 1, (0, 0, 5): 1}
+assert vd.proportional_weights(deep, {(0, 0, 0)}, 2, 'CONSTANT') == {}
+assert vd.proportional_weights(deep, {(0, 0, 0)}, 2, 'CONSTANT', view=(0, 0, 1)) == {(0, 0, 5): 1.0}  # projected
+
+# pull a slab up 3 with radius 3: a solid hill (stretch) vs loose voxels (no stretch)
+slab = {(x, y, z): 1 for x in range(-4, 5) for y in range(-4, 5) for z in range(-2, 1)}
+wl = vd.proportional_weights(slab, {(0, 0, 0)}, 3, 'LINEAR')
+ch, new_sel = vd.proportional_move(slab, {(0, 0, 0)}, wl, (0, 0, 3), stretch=True)
+hill = dict(slab)
+for c, (_old, new) in ch.items():
+    if new:
+        hill[c] = new
+    else:
+        hill.pop(c, None)
+assert new_sel == {(0, 0, 3)} and (0, 0, 3) in hill
+for x in range(-4, 5):
+    for y in range(-4, 5):
+        col = sorted(z for (a, b, z) in hill if (a, b) == (x, y))
+        assert col == list(range(col[0], col[-1] + 1)), (x, y, col)  # no holes in any column
+assert hill.get((1, 0, 2)) == 1 and (1, 0, 3) not in hill  # neighbour: round(0.67 * 3) = 2
+assert sorted(z for (a, b, z) in hill if (a, b) == (0, 0)) == [-1, 0, 1, 2, 3]  # bottom rises too, as in Blender
+assert sorted(z for (a, b, z) in hill if (a, b) == (4, 0)) == [-2, -1, 0]  # out of reach: untouched
+ch2, _ = vd.proportional_move(slab, {(0, 0, 0)}, wl, (0, 0, 3), stretch=False)
+assert any(not new for _old, new in ch2.values())  # plain move leaves gaps behind
+# push down 2: a crater, the voxels above the new floor are carved
+ch3, _ = vd.proportional_move(slab, {(0, 0, 0)}, wl, (0, 0, -2), stretch=True)
+crater = dict(slab)
+for c, (_old, new) in ch3.items():
+    if new:
+        crater[c] = new
+    else:
+        crater.pop(c, None)
+assert sorted(z for (a, b, z) in crater if (a, b) == (0, 0)) == [-3, -2]  # dent 2, bottom pushed out
+# sliding inside a solid row keeps it solid, colours slide along
+bar = {(x, 0, 0): 1 + (x == 0) for x in range(-4, 5)}
+chs, _ = vd.proportional_move(bar, {(0, 0, 0)}, vd.proportional_weights(bar, {(0, 0, 0)}, 3, 'LINEAR'), (2, 0, 0))
+slid = {c: chs.get(c, [0, k])[1] for c, k in bar.items()}
+assert set(c for c, k in slid.items() if k) == set(bar) and slid[(2, 0, 0)] == 2
+# diagonal move: no holes either
+chd, sel_d = vd.proportional_move(slab, {(0, 0, 0)}, wl, (2, 0, 2))
+assert sel_d == {(2, 0, 2)} and chd[(2, 0, 2)][1] == 1
+assert vd.proportional_move(slab, {(0, 0, 0)}, wl, (0, 0, 0)) == ({}, {(0, 0, 0)})
+assert vd._round_away(-1.5) == -2 and vd._round_away(1.5) == 2 and vd._round_away(0.49) == 0
+
 # --- palette removal shifts the indices above it
 assert vd.remap_removed_color({(0, 0, 0): 3, (1, 0, 0): 7, (2, 0, 0): 5}, 5) == \
     {(0, 0, 0): 3, (1, 0, 0): 6, (2, 0, 0): 5}

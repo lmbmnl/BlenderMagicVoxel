@@ -262,6 +262,72 @@ assert len(vd._handles) == 2
 vd._remove_draw_handlers()
 vd._remove_draw_handlers()
 assert vd._handles == []
+# proportional editing: the panel row drives Blender's own tool settings
+ts = ctx.scene.tool_settings
+vd.start_viewport_ui(vs)
+ui = vd._ui
+ui.layout(P, BOUNDS, 1.0)
+ui.env = type("Env", (), {"op": type("Op", (), {"report": lambda self, t, m: reports.append(m)})()})()
+ts.use_proportional_edit = False
+prop_btn = find(lambda w: isinstance(w, U.Button) and w.text == "Proportional")
+sharp = find(lambda w: isinstance(w, U.Button) and w.tooltip == "Falloff: Sharp")
+assert not sharp.enabled
+click(ui, prop_btn)
+assert ts.use_proportional_edit and sharp.enabled
+click(ui, sharp)
+assert ts.proportional_edit_falloff == 'SHARP'
+psize = find(lambda w: isinstance(w, U.Slider) and w.text == "Size (voxels)")
+vd.set_prop_distance(ts, 3.0)
+assert abs(psize.get() - 3.0) < 1e-6  # session voxel size 1
+psize.set(5.0)
+assert abs(vd.prop_distance(ts) - 5.0) < 1e-6
+proj = find(lambda w: isinstance(w, U.Button) and w.text == "Projected")
+ts.use_proportional_connected = True
+assert not proj.enabled  # like Blender: Projected is off while Connected is on
+ts.use_proportional_connected = False
+assert len(vd.FALLOFF_ITEMS) == 8 and all(i.curve for i in vd.FALLOFF_ICONS.values())
+
+# a real grab (G) with proportional editing: rays faked, everything else is the operator's
+import types  # noqa: E402
+from mathutils import Quaternion  # noqa: E402
+slab = {(x, y, z): 1 for x in range(-4, 5) for y in range(-4, 5) for z in range(-2, 1)}
+vd.save_cells(obj, slab, 1.0)
+G = type("G", (), {k: v for k, v in vd.VOXELDRAW_OT_start.__dict__.items() if callable(v)})
+g = G()
+g.cells, g.bounds, g.size, g.rev, g.face_key = dict(slab), vd.bounds_of(slab), 1.0, int(obj["_vd_rev"]), None
+vd._hist.update(undo=[], redo=[], rev=g.rev, obj=obj.name)
+region = types.SimpleNamespace(data=types.SimpleNamespace(view_rotation=Quaternion()))
+lift = [0.0]
+g._ray = lambda region, event, obj: ((100.0, 0.5, 0.5 + lift[0]), (-1.0, 0.0, 0.0))  # ray at height 0.5 + lift
+fctx = types.SimpleNamespace(scene=ctx.scene, workspace=types.SimpleNamespace(status_text_set=lambda t: None),
+                             window_manager=ctx.window_manager, area=types.SimpleNamespace(tag_redraw=lambda: None),
+                             view_layer=ctx.view_layer)
+ts.use_proportional_edit, ts.proportional_edit_falloff, ts.use_proportional_projected = True, 'LINEAR', False
+vd.set_prop_distance(ts, 3.0)
+vs.prop_stretch = True
+vd._sel.clear()
+vd._sel.add((0, 0, 0))
+g._grab_start(fctx, region, None, obj, {(0, 0, 0): 1}, {(0, 0, 0)}, line=2)
+assert g.grab["prop"] is not None and abs(g.grab["prop"]["radius"] - 3) < 1e-6
+lift[0] = 3.0
+g._grab_update(region, None, obj)
+assert g.grab["delta"] == (0, 0, 3) and (0, 0, 3) in vd._state["float"]
+ev = types.SimpleNamespace(type='WHEELUPMOUSE', value='PRESS', ctrl=False, shift=False, alt=False,
+                           mouse_x=0, mouse_y=0)
+real_rum, vd.region_under_mouse = vd.region_under_mouse, lambda area, event: region
+g._grab_modal(fctx, ev, obj)  # wheel: proportional size x 1.1, weights recomputed
+vd.region_under_mouse = real_rum
+assert abs(vd.prop_distance(ts) - 3.3) < 1e-6 and abs(g.grab["prop"]["radius"] - 3.3) < 1e-6
+g._grab_end(fctx, obj, True)
+hill = vd.load_cells(obj)
+assert (0, 0, 3) in hill and vd._sel == {(0, 0, 3)} and len(vd._hist["undo"]) == 1
+for x in range(-4, 5):
+    for y in range(-4, 5):
+        col = sorted(z for (a, b, z) in hill if (a, b) == (x, y))
+        assert col == list(range(col[0], col[-1] + 1))  # solid, no gaps
+assert vd._state["prop"] is None and vd._state["float_del"] is None
+ts.use_proportional_edit = False
+
 # the tool never leaves handlers / panels behind: errors, Blender cancelling it, closed area
 import types  # noqa: E402
 F = type("F", (), {k: v for k, v in vd.VOXELDRAW_OT_start.__dict__.items() if callable(v)})

@@ -675,6 +675,173 @@ def pick_cell(o, d, cells, bnds, size, axis, offset, existing):
     return tuple(cell), axis
 
 
+# Blender's proportional editing falloffs, as in its transform code: f = 1 - distance / radius
+FALLOFF = {
+    'SMOOTH': lambda f: 3 * f * f - 2 * f * f * f,
+    'SPHERE': lambda f: max(0.0, 2 * f - f * f) ** 0.5,
+    'ROOT': lambda f: max(0.0, f) ** 0.5,
+    'INVERSE_SQUARE': lambda f: f * (2 - f),
+    'SHARP': lambda f: f * f,
+    'LINEAR': lambda f: f,
+    'CONSTANT': lambda f: 1.0,
+}
+
+
+def _hash01(cell, seed):
+    """Stable pseudo random 0..1 per cell (Random falloff: same result every redraw)."""
+    h = (cell[0] * 73856093) ^ (cell[1] * 19349663) ^ (cell[2] * 83492791) ^ (seed * 2654435761)
+    h &= 0xffffffff
+    h = ((h ^ (h >> 16)) * 0x45d9f3b) & 0xffffffff
+    return ((h ^ (h >> 16)) & 0xffffff) / 0xffffff
+
+
+def falloff_weight(kind, f, cell=(0, 0, 0), seed=0):
+    if kind == 'RANDOM':
+        return _hash01(cell, seed) * f
+    return FALLOFF.get(kind, FALLOFF['SMOOTH'])(f)
+
+
+def proportional_weights(cells, sel, radius, kind, connected=False, view=None, seed=0):
+    """{cell: weight} of the unselected voxels within `radius` (in voxels) of the
+    selection, like Blender's proportional editing: straight distance to the
+    nearest selected voxel (measured on the view plane when `view`, the view
+    direction, is given: Projected), or steps through touching voxels (Connected)."""
+    sel = {c for c in sel if c in cells}
+    if not sel or radius <= 0:
+        return {}
+    dist = {}
+    if connected:
+        frontier, step = list(sel), 0
+        seen = set(sel)
+        while frontier and step + 1 <= radius:
+            step += 1
+            nxt = []
+            for x, y, z in frontier:
+                for q in ((x + 1, y, z), (x - 1, y, z), (x, y + 1, z), (x, y - 1, z), (x, y, z + 1), (x, y, z - 1)):
+                    if q in cells and q not in seen:
+                        seen.add(q)
+                        dist[q] = step
+                        nxt.append(q)
+            frontier = nxt
+    else:
+        from mathutils import Vector as V, kdtree
+        n = V(view).normalized() if view is not None else None
+
+        def flat(c):
+            p = V(c)
+            return p - n * p.dot(n) if n is not None else p
+        tree = kdtree.KDTree(len(sel))
+        for i, c in enumerate(sel):
+            tree.insert(flat(c), i)
+        tree.balance()
+        lo, hi = bounds_of(sel)
+        r = ceil(radius)
+        for c in cells:
+            if c in sel or (n is None and not all(lo[i] - r <= c[i] <= hi[i] + r for i in range(3))):
+                continue
+            d = tree.find(flat(c))[2]
+            if d <= radius:  # Blender includes the radius itself
+                dist[c] = d
+    return {c: w for c, d in dist.items() if (w := falloff_weight(kind, 1 - d / radius, c, seed)) > 0}
+
+
+def _round_away(v):
+    return int(floor(abs(v) + 0.5)) * (1 if v >= 0 else -1)
+
+
+def _deform_pass(cells, weight, axis, d):
+    """Deform along one axis: every voxel moves round(weight x d). Each solid run of a
+    row becomes the whole interval its moved voxels span (a continuous map sends an
+    interval to an interval), so the solid stretches or compresses without tearing.
+    Colours follow their voxels; stretched cells take the nearest moved colour.
+    -> (cells, weights) after the pass; rows with nothing moving are untouched."""
+    if d == 0:
+        return cells, weight
+    b, c = [i for i in range(3) if i != axis]
+
+    def row(p):
+        return p[b], p[c]
+
+    def at(r, t):
+        p = [0, 0, 0]
+        p[axis], p[b], p[c] = t, r[0], r[1]
+        return tuple(p)
+    moving = {row(p) for p, w in weight.items() if _round_away(w * d)}
+    if not moving:
+        return cells, weight
+    rows = {}
+    out, wout = {}, {}
+    for p, k in cells.items():
+        if row(p) in moving:
+            rows.setdefault(row(p), []).append(p[axis])
+        else:
+            out[p] = k
+            if p in weight:
+                wout[p] = weight[p]
+    for r, ts in rows.items():
+        ts.sort()
+        runs, cur = [], [ts[0]]
+        for t in ts[1:]:
+            if t == cur[-1] + 1:
+                cur.append(t)
+            else:
+                runs.append(cur)
+                cur = [t]
+        runs.append(cur)
+        for run in runs:
+            placed = {}
+            for t in run:
+                p = at(r, t)
+                w = weight.get(p, 0.0)
+                t2 = t + _round_away(w * d)
+                if t2 not in placed or placed[t2][0] < w:
+                    placed[t2] = (w, cells[p])
+            keys = sorted(placed)
+            j = 0
+            for t2 in range(keys[0], keys[-1] + 1):
+                while j + 1 < len(keys) and abs(keys[j + 1] - t2) < abs(keys[j] - t2):
+                    j += 1
+                w, k = placed[keys[j]]
+                q = at(r, t2)
+                if q not in wout or wout[q] < w:  # overlapping runs: the stronger one wins
+                    out[q], wout[q] = k, w
+                elif q not in out:
+                    out[q] = k
+    return out, wout
+
+
+def proportional_move(cells, sel, weights, delta, stretch=True):
+    """Move the selected voxels by `delta` and every weighted voxel by weight x delta
+    (rounded), like Blender's proportional editing moves vertices.
+    stretch=True: the model deforms as a solid, one axis of the move at a time
+    (_deform_pass), so no gaps open between voxels moved by different amounts.
+    stretch=False: voxels only jump to their new cell (gaps can open).
+    -> ({cell: [old, new]}, new positions of the selected voxels)"""
+    sel = {c for c in sel if c in cells}
+    w = {c: v for c, v in weights.items() if c in cells}
+    w.update({c: 1.0 for c in sel})
+    new_sel = {(c[0] + delta[0], c[1] + delta[1], c[2] + delta[2]) for c in sel}
+    if not any(delta) or not w:
+        return {}, new_sel
+    if stretch:
+        cur = dict(cells)
+        for axis in sorted(range(3), key=lambda i: -abs(delta[i])):
+            cur, w = _deform_pass(cur, w, axis, delta[axis])
+    else:
+        movers = {c: tuple(_round_away(v * x) for x in delta) for c, v in w.items()}
+        movers = {c: dv for c, dv in movers.items() if any(dv)}
+        cur = {c: k for c, k in cells.items() if c not in movers}
+        best = {}
+        for c, dv in movers.items():
+            t = (c[0] + dv[0], c[1] + dv[1], c[2] + dv[2])
+            if t not in best or best[t][0] < w[c]:
+                best[t] = (w[c], cells[c])
+        cur.update({t: k for t, (_v, k) in best.items()})
+    changes = {c: [cells.get(c, 0), cur.get(c, 0)] for c in set(cells) | set(cur)
+               if cells.get(c, 0) != cur.get(c, 0)}
+    return changes, new_sel
+
+
 def plane_cell(o, d, start, axis, size):
     """Cell under the ray on the layer of `start` (for Box / Line drags), max 256 away."""
     if abs(d[axis]) < 1e-9:
@@ -690,7 +857,7 @@ def plane_cell(o, d, start, axis, size):
 
 _drawing = False
 _state = {"area": 0, "hover": None, "size": 1.0, "mode": 'ATTACH', "float": None,
-          "ring_hover": None, "spin": None,
+          "ring_hover": None, "spin": None, "float_del": None, "prop": None,
           "rect": None, "bounds": None, "pick": False, "gizmo_hover": None, "line": None}
 # Own undo history: entries are ({cell: [old_colour, new_colour]}, voxel_size),
 # colour 0 = empty. "rev" is the revision of object "obj" (name) produced by our
@@ -824,6 +991,20 @@ def selection_action(vs, cells, action, axis=0, ccw=False, delta=(0, 0, 0)):
     _sel.clear()
     _sel.update(new_sel)
     return changes
+
+
+def prop_distance(ts):
+    """Blender's proportional size (scene units). 5.x shows `proportional_distance`;
+    it shares its value with the older `proportional_size`."""
+    return getattr(ts, "proportional_distance", None) or ts.proportional_size
+
+
+def set_prop_distance(ts, v):
+    v = max(1e-5, min(5000.0, v))
+    if hasattr(ts, "proportional_distance"):
+        ts.proportional_distance = v
+    else:
+        ts.proportional_size = v
 
 
 def view_axes(rv3d, obj):
@@ -1132,6 +1313,11 @@ class VoxelSettings(bpy.types.PropertyGroup):
         description="Axes of the live mirror. The plane goes through the first voxel "
                     "(the one spawned on the 3D cursor), or through the model centre "
                     "when Limit Model Size is on")
+    prop_stretch: bpy.props.BoolProperty(
+        name="Stretch", default=True, update=_redraw,
+        description="Proportional editing: the model deforms as a solid, voxels moved by "
+                    "different amounts stretch or squeeze the rows between them, so no gaps "
+                    "open. Off: every voxel only jumps to its new cell")
     rotate_gizmo: bpy.props.BoolProperty(
         name="Rotate Gizmo", default=False, update=_redraw,
         description="Show rotation rings at the centre of the selection: drag a ring to "
@@ -1482,12 +1668,16 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         centre = [(lo[i] + hi[i] + 1) / 2 * self.size for i in range(3)]
         self.grab = {"float": floating, "remove": remove, "axis": a, "plane": centre[a],
                      "centre": centre, "line": line, "drag": drag,
-                     "start": None, "move": [0, 0, 0], "nudge": [0, 0, 0], "delta": (0, 0, 0)}
+                     "start": None, "move": [0, 0, 0], "nudge": [0, 0, 0], "delta": (0, 0, 0),
+                     "prop": None, "result": None}
         _state.update(hover=None, line=line)
+        if remove:  # moving voxels (not a paste / duplicate): Blender's proportional editing
+            self._prop_setup(context, region, obj)
         self._grab_update(region, event, obj)
         context.workspace.status_text_set(
             ("Move: drag    release: confirm" if drag else
-             "Move: mouse, Arrows, PgUp / PgDn    LMB / Enter: confirm") + "    RMB / Esc: cancel")
+             "Move: mouse, Arrows, PgUp / PgDn    LMB / Enter: confirm") + "    RMB / Esc: cancel"
+            + "    O: proportional    Wheel: proportional size")
         tag_redraw_all(context)
 
     def _grab_update(self, region, event, obj):
@@ -1511,12 +1701,47 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
                 g["move"] = [0 if i == a else floor((p[i] - g["start"][i]) / self.size + 0.5)
                              for i in range(3)]
         dx = g["delta"] = tuple(g["move"][i] + g["nudge"][i] for i in range(3))
-        _state["float"] = [(c[0] + dx[0], c[1] + dx[1], c[2] + dx[2]) for c in g["float"]]
+        if g["prop"] is not None:
+            p = g["prop"]
+            g["result"] = proportional_move(self.cells, set(g["float"]), p["weights"], dx, p["stretch"])
+            changes = g["result"][0]
+            _state["float"] = [c for c, (_o, n) in changes.items() if n] or list(g["float"])
+            _state["float_del"] = [c for c, (_o, n) in changes.items() if not n]
+        else:
+            _state["float"] = [(c[0] + dx[0], c[1] + dx[1], c[2] + dx[2]) for c in g["float"]]
+            _state["float_del"] = None
+
+    def _prop_setup(self, context, region, obj):
+        """(Re)compute the proportional weights of the grab from Blender's settings."""
+        g = self.grab
+        g["prop"] = _state["prop"] = None
+        ts = context.scene.tool_settings
+        if not ts.use_proportional_edit:
+            return
+        g["prop"] = self._prop_params(context, region, obj, set(g["float"]))
+        _state["prop"] = (g["centre"], g["prop"]["radius"] * self.size)
+
+    def _prop_params(self, context, region, obj, sel):
+        ts = context.scene.tool_settings
+        vs = context.scene.voxel_settings
+        radius = prop_distance(ts) / self.size  # Blender's size is in scene units
+        view = None
+        if ts.use_proportional_projected and not ts.use_proportional_connected and region is not None:
+            view = tuple(obj.matrix_world.to_3x3().inverted_safe()
+                         @ (region.data.view_rotation @ Vector((0, 0, 1))))
+        weights = proportional_weights(self.cells, sel, radius, ts.proportional_edit_falloff,
+                                       ts.use_proportional_connected, view, seed=len(sel))
+        return {"weights": weights, "radius": radius, "stretch": vs.prop_stretch}
 
     def _grab_end(self, context, obj, ok):
         g, self.grab = self.grab, None
-        _state.update(float=None, line=None)
-        if ok:
+        _state.update(float=None, line=None, float_del=None, prop=None)
+        if ok and g["prop"] is not None:
+            changes, new_sel = g["result"] or ({}, set(g["float"]))
+            self._commit(context, obj, changes)
+            _sel.clear()
+            _sel.update(new_sel)
+        elif ok:
             dx = g["delta"]
             moved = {(c[0] + dx[0], c[1] + dx[1], c[2] + dx[2]): k for c, k in g["float"].items()}
             new = {c: 0 for c in g["remove"]}
@@ -1547,6 +1772,19 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             self.grab["nudge"][a] += s * sign
             self._grab_update(None, event, obj)
             context.area.tag_redraw()
+        elif pressed and t == 'O' and self.grab["remove"] and not (event.ctrl or event.alt or event.shift):
+            ts = context.scene.tool_settings  # Blender's own proportional toggle (O)
+            ts.use_proportional_edit = not ts.use_proportional_edit
+            self._prop_setup(context, region, obj)
+            self._grab_update(None, event, obj)
+            tag_redraw_all(context)
+        elif (t in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and self.grab["prop"] is not None
+              and not (event.ctrl or event.shift or event.alt)):
+            ts = context.scene.tool_settings  # like Blender: wheel resizes the proportional circle
+            set_prop_distance(ts, prop_distance(ts) * (1.1 if t == 'WHEELUPMOUSE' else 1 / 1.1))
+            self._prop_setup(context, region, obj)
+            self._grab_update(None, event, obj)
+            tag_redraw_all(context)
         elif t == 'MIDDLEMOUSE' or t.startswith(('WHEEL', 'NUMPAD', 'TRACKPAD', 'NDOF')):
             return {'PASS_THROUGH'}  # navigation keeps working
         return {'RUNNING_MODAL'}
@@ -1697,7 +1935,14 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             a, s = axes[which]
             delta = [0, 0, 0]
             delta[a] = s * sign
-            changes = selection_action(vs, self.cells, 'MOVE', delta=delta)
+            sel = {c for c in _sel if c in self.cells}
+            if context.scene.tool_settings.use_proportional_edit and sel:
+                p = self._prop_params(context, region, obj, sel)
+                changes, new_sel = proportional_move(self.cells, sel, p["weights"], delta, p["stretch"])
+                _sel.clear()
+                _sel.update(new_sel)
+            else:
+                changes = selection_action(vs, self.cells, 'MOVE', delta=delta)
         elif t in ('DEL', 'X') and not ctrl:
             changes = selection_action(vs, self.cells, 'DELETE')
         elif t == 'P' and not ctrl:
@@ -2351,6 +2596,18 @@ class VOXELDRAW_PT_selection(_Panel, bpy.types.Panel):
         row.operator("voxeldraw.selection", text="Delete", icon='TRASH').action = 'DELETE'
         row.operator("voxeldraw.selection", text="Paint", icon='BRUSH_DATA').action = 'PAINT'
         row.operator("voxeldraw.selection", text="Copy", icon='COPYDOWN').action = 'COPY'
+        ts = context.tool_settings  # the same settings as the Edit Mode header (O)
+        row = layout.row(align=True)
+        icon = ('PROP_OFF' if not ts.use_proportional_edit else 'PROP_CON' if ts.use_proportional_connected
+                else 'PROP_PROJECTED' if ts.use_proportional_projected else 'PROP_ON')
+        row.prop(ts, "use_proportional_edit", icon_only=True, icon=icon)
+        sub = row.row(align=True)
+        sub.active = ts.use_proportional_edit
+        sub.prop_with_popover(ts, "proportional_edit_falloff", text="", icon_only=True,
+                              panel="VIEW3D_PT_proportional_edit")
+        sub.prop(ts, "proportional_distance" if hasattr(ts, "proportional_distance") else "proportional_size",
+                 text="Size")
+        sub.prop(context.scene.voxel_settings, "prop_stretch", toggle=True)
 
 
 class VOXELDRAW_PT_palette(_Panel, bpy.types.Panel):
@@ -2532,6 +2789,8 @@ def _draw_preview():
         else:
             color = (*vs.palette[vs.color_index].color, 1)
         _draw_ghost(rv3d, obj, cells, size, color)
+    if _state["float_del"]:  # voxels the proportional move removes
+        _draw_ghost(rv3d, obj, _state["float_del"], size, (1, 0.25, 0.2, 1), xray=True)
     if _state["float"]:  # moving voxels stay visible through the model
         _draw_ghost(rv3d, obj, _state["float"], size, (0.2, 0.9, 1, 1), xray=True)
 
@@ -2611,6 +2870,26 @@ def _draw_rot_gizmo(region, rv3d, obj):
         blf.draw(0, f"{spin[1] * 45:+d}°")
 
 
+def _draw_prop_circle(region, rv3d, obj):
+    """Proportional size as a screen circle around the moved voxels, like Blender's."""
+    centre, radius = _state["prop"]
+    mw = obj.matrix_world
+    c = Vector(centre)
+    c2 = location_3d_to_region_2d(region, rv3d, mw @ c)
+    right = mw.to_3x3().inverted_safe() @ (rv3d.view_rotation @ Vector((1, 0, 0)))
+    p2 = location_3d_to_region_2d(region, rv3d, mw @ (c + right.normalized() * radius))
+    if c2 is None or p2 is None:
+        return
+    r = (p2 - c2).length
+    pts = [(c2.x + r * cos(2 * pi * i / 64), c2.y + r * sin(2 * pi * i / 64), 0) for i in range(65)]
+    shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    shader.bind()
+    shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+    shader.uniform_float("lineWidth", 1.5 * bpy.context.preferences.system.ui_scale)
+    shader.uniform_float("color", (1, 1, 1, 0.55))
+    batch_for_shader(shader, 'LINE_STRIP', {"pos": pts}).draw(shader)
+
+
 def draw_overlay():
     try:
         _draw_overlay()
@@ -2645,6 +2924,10 @@ def _draw_overlay():
     if vs.rotate_gizmo and _sel:
         gpu.state.blend_set('ALPHA')
         _draw_rot_gizmo(context.region, context.region_data, obj)
+        gpu.state.blend_set('NONE')
+    if _state["prop"] is not None:
+        gpu.state.blend_set('ALPHA')
+        _draw_prop_circle(context.region, context.region_data, obj)
         gpu.state.blend_set('NONE')
     if _ui is not None and vs.viewport_ui:
         if context.region == ui_region(area):  # quad view: panels in one region only
@@ -2707,6 +2990,7 @@ SHORTCUTS = (
     ("G / Shift+D", "move / duplicate"), ("R  F  Shift+F", "rotate / flip"),
     ("Arrows PgUp PgDn", "nudge"), ("X / P", "delete / paint selection"),
     ("Ctrl+C / Ctrl+V", "copy / paste"), ("Ctrl+Z  Ctrl+Shift+Z", "undo / redo"),
+    ("O", "proportional editing (Blender's)"), ("Wheel while moving", "proportional size"),
     ("Tab", "pause"), ("Esc", "exit the tool"), ("U", "viewport panels"), ("H", "this list"),
 )
 
@@ -2908,6 +3192,7 @@ def build_viewport_ui():
             axis_ops('FLIP', "Flip", ICONS['flip'], "Flip along"),
             toggle("rotate_gizmo", "Gizmo 45°", ICONS['rotate'],
                    "Rotation rings on the selection: drag a ring, 45° steps")),
+        *proportional_rows(),
     ), icon=ICONS['selection'], anchor=(0.5, 1), offset=(0, 8))
 
     # -- bottom left: scene and files
@@ -2939,6 +3224,61 @@ def build_viewport_ui():
 
     return vd_ui.UI([scene, keys, selection, symmetry, session, palette, brush, tools],
                     on_layout=_save_layout)
+
+
+def _ts():
+    return bpy.context.scene.tool_settings
+
+
+def _cell_size():
+    """Voxel size of the session (scene units): Blender's proportional size is in scene units."""
+    vs = _vs()
+    return session_size(vs.target, vs) if vs.target is not None else vs.voxel_size
+
+
+FALLOFF_ITEMS = [(i.identifier, i.name) for i in
+                 bpy.types.ToolSettings.bl_rna.properties["proportional_edit_falloff"].enum_items]
+FALLOFF_ICONS = {k: vd_ui.CURVE(lambda x, k=k: falloff_weight(k, 1 - x, (round(x * 24), 0, 0), 7))
+                 for k, _name in FALLOFF_ITEMS}
+
+
+def proportional_rows():
+    """Blender's proportional editing settings (the Edit Mode header ones) for moving
+    selected voxels: toggle, falloff, size in voxels, Connected / Projected, Stretch."""
+    B, Row, S = vd_ui.Button, vd_ui.Row, vd_ui.Slider
+
+    def ts_toggle(attr, text, tip, enabled=True):
+        return B(text, tooltip=tip, active=lambda: getattr(_ts(), attr), enabled=enabled,
+                 on_click=lambda env: setattr(_ts(), attr, not getattr(_ts(), attr)))
+
+    on = lambda: _ts().use_proportional_edit  # noqa: E731
+
+    def size_get():
+        return prop_distance(_ts()) / _cell_size()
+
+    def size_set(v):
+        set_prop_distance(_ts(), v * _cell_size())
+
+    return (
+        Row(B("Proportional", icon=None, tooltip="Blender's proportional editing (O): moving the "
+              "selection (G, gizmo, arrows) also moves the voxels around it",
+              active=on, on_click=lambda env: setattr(_ts(), "use_proportional_edit", not on())),
+            *[B("", icon=FALLOFF_ICONS[k], tooltip=f"Falloff: {name}", enabled=on, min_w=30, icon_scale=1.15,
+                active=lambda k=k: _ts().proportional_edit_falloff == k,
+                on_click=lambda env, k=k: setattr(_ts(), "proportional_edit_falloff", k))
+              for k, name in FALLOFF_ITEMS]),
+        Row(S("Size (voxels)", size_get, size_set, 0.5, 256.0, digits=1, step=1, log=True, min_w=150,
+              enabled=on, tooltip="Proportional size (wheel while moving)", flex=True),
+            ts_toggle("use_proportional_connected", "Connected",
+                      "Only voxels touching the selection, measured through them", on),
+            ts_toggle("use_proportional_projected", "Projected",
+                      "Distance measured on the screen (ignores depth)",
+                      lambda: on() and not _ts().use_proportional_connected),
+            B("Stretch", tooltip="Pulled voxels fill their path, pushed ones carve it\n"
+              "(off: voxels only move, gaps can open)", enabled=on,
+              active=lambda: _vs().prop_stretch,
+              on_click=lambda env: setattr(_vs(), "prop_stretch", not _vs().prop_stretch))),
+    )
 
 
 def _save_layout(state):

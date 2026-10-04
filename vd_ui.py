@@ -81,10 +81,10 @@ class Icon:
     """One of Blender's toolbar icons (datafiles/icons/<name>.dat: coloured vector
     triangles), or a glyph of a font shipped with Blender. Blender's named UI icons
     ('TRASH', ...) can't be drawn from Python outside UILayout, hence these two."""
-    __slots__ = ("dat", "glyph", "font")
+    __slots__ = ("dat", "glyph", "font", "curve")
 
-    def __init__(self, dat=None, glyph=None, font=SYMBOLS):
-        self.dat, self.glyph, self.font = dat, glyph, font
+    def __init__(self, dat=None, glyph=None, font=SYMBOLS, curve=None):
+        self.dat, self.glyph, self.font, self.curve = dat, glyph, font, curve
 
 
 def DAT(name):
@@ -93,6 +93,16 @@ def DAT(name):
 
 def GLYPH(char, font=SYMBOLS):
     return Icon(glyph=char, font=font)
+
+
+def CURVE(fn, samples=24):
+    """Plot of fn(x), x and fn in 0..1 (e.g. a falloff curve)."""
+    return Icon(curve=[(i / samples, max(0.0, min(1.0, fn(i / samples)))) for i in range(samples + 1)])
+
+
+def curve_points(icon, x, y, size):
+    m = size * 0.06
+    return [(x + m + u * (size - 2 * m), y + m + v * (size - 2 * m)) for u, v in icon.curve]
 
 
 _dat_cache = {}
@@ -233,6 +243,8 @@ class GPUPainter:
             b = self._batch(self.smooth, 'TRIS', {"pos": pos, "color": col})
             self.smooth.bind()
             b.draw(self.smooth)
+        elif icon.curve:
+            self.polyline(curve_points(icon, x, y, size), _mix(color or THEME["text"], alpha), 2.0 * size / ICON)
         elif icon.glyph:
             gs = size * 0.9
             w, h = self.text_size(icon.glyph, gs, icon.font)
@@ -386,10 +398,10 @@ class Separator(Widget):
         p.rect(x, y + h / 2 - 0.5 * ui.s, w, 1 * ui.s, THEME["sep"])
 
 
-def _icon_text_size(ui, p, icon, text, size):
+def _icon_text_size(ui, p, icon, text, size, icon_scale=1.0):
     s = ui.s
     tw = p.text_size(text, size)[0] if text else 0
-    iw = ICON * s if icon else 0
+    iw = ICON * icon_scale * s if icon else 0
     return iw, tw, iw + tw + (4 * s if icon and text else 0)
 
 
@@ -402,17 +414,18 @@ def _fit(p, text, size, width):
     return text + "…" if text else ""
 
 
-def _draw_icon_text(ui, p, x, y, w, h, icon, text, color, alpha, align="CENTER", size=None):
+def _draw_icon_text(ui, p, x, y, w, h, icon, text, color, alpha, align="CENTER", size=None,
+                    icon_scale=1.0):
     s = ui.s
     size = size or FONT * s
-    iw, tw, total = _icon_text_size(ui, p, icon, text, size)
+    iw, tw, total = _icon_text_size(ui, p, icon, text, size, icon_scale)
     room = w - 2 * PAD * s
     if total > room and text:  # shorten the text, keep the icon
         text = _fit(p, text, size, room - iw - (4 * s if icon else 0))
-        iw, tw, total = _icon_text_size(ui, p, icon, text, size)
+        iw, tw, total = _icon_text_size(ui, p, icon, text, size, icon_scale)
     left = x + (w - total) / 2 if align == "CENTER" else x + PAD * s
     if icon:
-        p.icon(icon, left, y + (h - ICON * s) / 2, ICON * s, alpha, color)
+        p.icon(icon, left, y + (h - iw) / 2, iw, alpha, color)
         left += iw + 4 * s
     if text:
         p.text(text, left, y + h / 2 - size * 0.36, size, _mix(color, alpha))
@@ -441,10 +454,11 @@ class Button(Widget):
     buttons are Buttons whose `active` reads the bound value."""
     interactive = True
 
-    def __init__(self, text="", *, icon=None, on_click=None, active=False, min_w=0, align="CENTER", **kw):
+    def __init__(self, text="", *, icon=None, on_click=None, active=False, min_w=0, align="CENTER",
+                 icon_scale=1.0, **kw):
         super().__init__(**kw)
         self.text, self.icon, self.on_click, self.active, self.min_w = text, icon, on_click, active, min_w
-        self.align = align
+        self.align, self.icon_scale = align, icon_scale
 
     def measure(self, ui):
         s = ui.s
@@ -464,7 +478,7 @@ class Button(Widget):
             bg = THEME["hover"] if hover else THEME["widget"]
         p.rect(x, y, w, h, bg if en else _mix(bg, 0.5), RADIUS * ui.s)
         _draw_icon_text(ui, p, x, y, w, h, self.icon, _val(self.text), THEME["text"],
-                        1.0 if en else 0.35, self.align)
+                        1.0 if en else 0.35, self.align, icon_scale=self.icon_scale)
 
     def press(self, ui, mx, my, ev):
         if not self.enabled:
