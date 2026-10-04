@@ -1,6 +1,7 @@
 # Run: blender -b --factory-startup --python test_voxeldraw.py
 import importlib.util
 import os
+import struct
 import sys
 
 import bmesh
@@ -82,6 +83,27 @@ assert len(vd.stamp_cells((0, 0, 0), 2, 'SPHERE', 5, 0)) < len(vd.stamp_cells((0
 assert vd.mirror_cells([(0, 0, 0)], [0]) == [(0, 0, 0)]  # the first voxel is on the mirror plane
 assert sorted(vd.mirror_cells([(2, 0, 0)], [0])) == [(-2, 0, 0), (2, 0, 0)]
 assert len(vd.mirror_cells([(1, 1, 1)], [0, 1, 2])) == 8
+# with the size limit the plane is the model centre: 0..39 maps onto itself
+assert sorted(vd.mirror_cells([(3, 0, 0)], [0], (39, 0, 0))) == [(3, 0, 0), (36, 0, 0)]
+assert sorted(vd.mirror_cells([(19, 0, 0)], [0], (39, 0, 0))) == [(19, 0, 0), (20, 0, 0)]
+
+
+class MV:
+    mirror_live, mirror, use_limit, model_size = True, (True, False, True), False, (40, 40, 40)
+
+
+assert vd.live_mirror_axes(MV) == [0, 2] and vd.mirror_sums(MV) == (0, 0, 0)
+assert len(vd.mirrored(MV, [(2, 0, 3)])) == 4
+MV.use_limit = True
+assert vd.mirror_sums(MV) == (39, 39, 39)
+assert all(0 <= c[i] < 40 for c in vd.mirrored(MV, [(2, 5, 3)]) for i in range(3))  # nothing clipped
+(ax, quad), (ax2, _) = vd.mirror_planes(MV, None)
+assert (ax, ax2) == (0, 2) and all(p[0] == 20 for p in quad)  # plane in the middle of 0..40
+MV.use_limit = False
+assert all(p[0] == 0.5 for p in vd.mirror_planes(MV, ((0, 0, 0), (3, 3, 3)))[0][1])  # middle of voxel 0
+MV.mirror_live = False
+assert vd.live_mirror_axes(MV) == [] and vd.mirrored(MV, [(2, 0, 3)]) == [(2, 0, 3)]
+assert vd.mirror_planes(MV, None) == []
 assert vd.line_cells((0, 0, 0), (4, 2, 0)) == [(0, 0, 0), (1, 1, 0), (2, 1, 0), (3, 2, 0), (4, 2, 0)]
 assert len(vd.box_cells((0, 0, 0), (3, 2, 0), 2, True)) == 12
 assert len(vd.box_cells((0, 0, 0), (3, 2, 0), 2, False)) == 10
@@ -117,6 +139,7 @@ assert changes == {(1, 0, 0): [2, 1]}  # duplicate overwrites the target, keeps 
 
 class VS:
     color_index = 9
+    use_limit, model_size = False, (40, 40, 40)
 
 
 vd._sel.clear()
@@ -130,6 +153,15 @@ vd._sel.clear()
 vd._sel.update({(1, 0, 0), (2, 0, 0)})
 ch = vd.selection_action(VS, shape, 'MIRROR', axis=0)  # copy across the first-voxel plane
 assert ch == {(-1, 0, 0): [0, 2], (-2, 0, 0): [0, 3]} and len(vd._sel) == 4
+
+# --- brush ghost: outer faces only (pushed out), unique edges
+tris, segs = vd.ghost_geometry([(0, 0, 0)])
+assert tris.shape == (36, 3) and segs.shape == (24, 3)
+assert tris.min() < 0 and tris.max() > 1  # inflated past the voxel
+tris, segs = vd.ghost_geometry([(0, 0, 0), (1, 0, 0), (1, 0, 0)])
+assert tris.shape == (60, 3) and segs.shape == (40, 3)  # 10 faces; 8 + 8 unit edges + 4 seam edges
+edges = {frozenset(map(tuple, e)) for e in segs.reshape(-1, 2, 3).tolist()}
+assert len(edges) == 20 and frozenset({(1, 0, 0), (1, 1, 0)}) in edges  # seam kept once
 
 # --- gizmo geometry
 assert abs(vd.ray_axis_param((5, 3, 10), (0, 0, -1), (0, 0, 0), 0) - 5) < 1e-9
@@ -156,6 +188,31 @@ try:
     raise AssertionError("too big must fail")
 except ValueError:
     pass
+
+
+def chunk(cid, content, children=b""):
+    return cid + struct.pack("<ii", len(content), len(children)) + content + children
+
+
+def vox(*chunks):
+    return b"VOX " + struct.pack("<i", 150) + chunk(b"MAIN", b"", b"".join(chunks))
+
+
+d0 = struct.pack("<i", 0)  # empty dict
+empty_vox = vox(chunk(b"SIZE", struct.pack("<3i", 1, 1, 1)), chunk(b"XYZI", d0))
+assert vd.read_vox(empty_vox) == ({}, None)
+good = vd.vox_bytes(two_col, pal)
+bad = [good[:n] for n in (20, 40, 60, len(good) - 1)]
+bad.append(vox(chunk(b"nTRN", struct.pack("<i", 0) + d0 + struct.pack("<4i", 1, -1, -1, 1) + d0),
+               chunk(b"nSHP", struct.pack("<i", 1) + d0 + struct.pack("<2i", 1, 5) + d0)))  # no model 5
+bad.append(vox(chunk(b"nTRN", struct.pack("<i", 0) + d0 + struct.pack("<4i", 1, -1, -1, 1) + d0),
+               chunk(b"nGRP", struct.pack("<i", 1) + d0 + struct.pack("<2i", 1, 0))))  # loop 0 -> 1 -> 0
+for data in bad:
+    try:
+        vd.read_vox(data)
+        raise AssertionError("damaged file must fail")
+    except ValueError as e:
+        assert "Damaged" in str(e), e
 
 # --- picking
 hit = vd.pick_cell((0.5, 0.5, 10), (0, 0, -1), one, vd.bounds_of(one), 1.0, 2, 0.0, False)
@@ -217,6 +274,18 @@ path = os.path.join(bpy.app.tempdir, "vd_test.vox")
 assert bpy.ops.voxeldraw.export_vox(filepath=path) == {'FINISHED'}
 bpy.ops.voxeldraw.clear()
 assert not vd.load_cells(obj)
+assert vd.history_valid(obj)  # Start keeps this history: Ctrl+Z brings the voxels back
+assert sum(1 for _old, new in vd._hist["undo"][-1][0].values() if new == 0) == len(two_col) - 1
+for name, data, msg in (("vd_empty.vox", empty_vox, "no voxels"), ("vd_bad.vox", good[:60], "Damaged")):
+    p = os.path.join(bpy.app.tempdir, name)
+    with open(p, "wb") as f:
+        f.write(data)
+    try:
+        bpy.ops.voxeldraw.import_vox(filepath=p)
+        raise AssertionError("must be refused")
+    except RuntimeError as e:
+        assert msg in str(e), e
+    assert vd.history_valid(obj)  # session and its undo untouched
 assert bpy.ops.voxeldraw.import_vox(filepath=path) == {'FINISHED'}
 assert len(vd.load_cells(obj)) == len(two_col) - 1
 assert tuple(round(x, 2) for x in vs.palette[5].color) == (1, 0, 0)  # palette came back too
@@ -235,6 +304,27 @@ assert len(vs.palette) == 255 and vs.palette[2].name == "Skin" and tuple(vs.pale
 assert set(vd.load_cells(obj).values()) == {2} and vs.color_index == 2
 assert bpy.ops.voxeldraw.palette_add() == {'FINISHED'} and len(vs.palette) == 256
 assert vs.color_index == 255 and vd.palette_array(scene).shape == (256, 3)
+
+# Confirm refused (session object in Edit Mode, another object active) leaves the session alone
+other = bpy.data.objects.new("other", bpy.data.meshes.new("other"))
+scene.collection.objects.link(other)
+for o in (obj, other):
+    o.select_set(True)
+bpy.context.view_layer.objects.active = other
+bpy.ops.object.mode_set(mode='EDIT')
+assert obj.mode == 'EDIT'
+vd._drawing = True
+undo_len = len(vd._hist["undo"])
+try:
+    bpy.ops.voxeldraw.confirm()
+    raise AssertionError("must be refused")
+except RuntimeError as e:
+    assert "Leave Edit Mode first" in str(e)
+assert vd._drawing and len(vd._hist["undo"]) == undo_len and "_vd_cells" in obj
+bpy.ops.object.mode_set(mode='OBJECT')
+vd._drawing = False
+bpy.data.objects.remove(other)
+bpy.context.view_layer.objects.active = obj
 
 vs.greedy = True
 assert bpy.ops.voxeldraw.confirm() == {'FINISHED'}

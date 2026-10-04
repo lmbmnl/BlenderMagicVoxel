@@ -6,7 +6,9 @@ MagicaVoxel-style voxel editor inside Blender 5.x: draw coloured voxels directly
 
 - 255-colour palette (MagicaVoxel default), rename / add / remove colours, eyedropper
 - Brushes: point, square, triangle, hexagon, circle, sphere (filled or outline), box, line, face extrude, fill
-- Live mirror across the first voxel (spawned on the 3D cursor)
+- Live Mirror toggle (M) for every brush, with the mirror plane drawn in the viewport: across the
+  first voxel (spawned on the 3D cursor), or across the model centre when the size limit is on
+- Placement preview with a thick outline, translucent fill and see-through hint
 - Select, move with a snapped gizmo, rotate, flip, mirror, duplicate, copy / paste
 - `.vox` import / export with palette
 - Greedy meshing on Confirm, voxel size in scene units

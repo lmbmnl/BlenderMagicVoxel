@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "voxel_draw"
-version = "2.4.0"
+version = "2.5.0"
 name = "VoxelDraw"
 tagline = "MagicaVoxel-style voxel drawing with palette and brushes"
 maintainer = "Marclo"
@@ -16,5 +16,8 @@ blender_version_min = "5.0.0"
 license = ["SPDX:MIT"]
 copyright = ["2026 lmbmnl", "2020 Sreeraj R"]
 
+[permissions]
+files = "Import/export MagicaVoxel .vox files and load palette images"
+
 [build]
-paths_exclude_pattern = ["__pycache__/", "test_*.py", "README.md", ".gitignore"]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "/*.zip", "test_*.py", "README.md", ".gitignore"]

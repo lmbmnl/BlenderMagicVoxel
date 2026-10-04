@@ -162,6 +162,44 @@ def build_geometry(cells, size, greedy=False):
     return verts, inv.reshape(-1, 4), np.concatenate(cols)
 
 
+def ghost_geometry(cells, inflate=0.02):
+    """Brush ghost in lattice units: (triangles (3t,3) of its outer faces pushed out by
+    `inflate` so they never z-fight the voxels they cover, unique edges (2e,3) of
+    those faces). Inner faces / edges between ghost voxels are left out."""
+    tris, quads = [], []
+    for (normal, quad), (pos, _col) in zip(FACES, exposed_faces(dict.fromkeys(cells, 1))):
+        q = pos[:, None, :] + np.array(quad)
+        quads.append(q)
+        tris.append((q + np.array(normal) * inflate)[:, (0, 1, 2, 0, 2, 3)])
+    seg = np.concatenate(quads)[:, ((0, 1), (1, 2), (2, 3), (3, 0))].reshape(-1, 2, 3)
+    k = _keys(seg.reshape(-1, 3)).reshape(-1, 2)
+    _, first = np.unique(np.sort(k, axis=1), axis=0, return_index=True)
+    return (np.concatenate(tris).reshape(-1, 3).astype(np.float32),
+            seg[np.sort(first)].reshape(-1, 3).astype(np.float32))
+
+
+def mirror_planes(vs, bnds):
+    """Live mirror planes as quads (4 corners, lattice units) + axis: [(axis, corners)].
+    They span the size limit box, or the model bounds plus a margin."""
+    sums = mirror_sums(vs)
+    if vs.use_limit:
+        lo, hi = (0, 0, 0), tuple(vs.model_size)
+    else:
+        lo, hi = bnds or ((0, 0, 0), (0, 0, 0))
+        lo = [min(lo[i], 0) - 2 for i in range(3)]
+        hi = [max(hi[i], 0) + 3 for i in range(3)]
+    out = []
+    for a in live_mirror_axes(vs):
+        b, c = [i for i in range(3) if i != a]
+        corners = []
+        for u, v in ((lo[b], lo[c]), (hi[b], lo[c]), (hi[b], hi[c]), (lo[b], hi[c])):
+            p = [0.0, 0.0, 0.0]
+            p[a], p[b], p[c] = (sums[a] + 1) / 2, u, v
+            corners.append(p)
+        out.append((a, corners))
+    return out
+
+
 def _outline(pts, dirs):
     return {p for p in pts
             if any(tuple(p[i] + d[i] for i in range(len(p))) not in pts for d in dirs)}
@@ -221,17 +259,33 @@ def stamp_cells(cell, axis, shape, n, rot, fill=False):
     return out
 
 
-def mirror_cell(c, axis):
-    """Mirror across the plane through the middle of voxel (0,0,0), the first voxel
-    spawned on the 3D cursor."""
-    return tuple(-c[i] if i == axis else c[i] for i in range(3))
+def mirror_cell(c, axis, s=0):
+    """Mirror cell i to s - i. s = 0: plane through the middle of voxel (0,0,0), the
+    first voxel spawned on the 3D cursor; s = size - 1: centre of a 0..size model."""
+    return tuple(s - c[i] if i == axis else c[i] for i in range(3))
 
 
-def mirror_cells(cells, axes):
+def mirror_cells(cells, axes, sums=(0, 0, 0)):
     out = set(cells)
     for a in axes:
-        out |= {mirror_cell(c, a) for c in out}
+        out |= {mirror_cell(c, a, sums[a]) for c in out}
     return list(out)
+
+
+def live_mirror_axes(vs):
+    return [i for i, on in enumerate(vs.mirror) if on] if vs.mirror_live else []
+
+
+def mirrored(vs, cells):
+    """Brush cells plus their live-mirror copies."""
+    axes = live_mirror_axes(vs)
+    return mirror_cells(cells, axes, mirror_sums(vs)) if axes else cells
+
+
+def mirror_sums(vs):
+    """Per-axis s of mirror_cell: the model centre when the size limit is on (the
+    first voxel would sit on the limit edge), else the first voxel."""
+    return tuple(n - 1 for n in vs.model_size) if vs.use_limit else (0, 0, 0)
 
 
 def ray_axis_param(o, d, c, axis):
@@ -393,14 +447,26 @@ def _vox_rot(r):
 
 def read_vox(data):
     """-> (cells shifted to start at 0, palette list[256] or None). Merges every
-    model of the scene graph with its translation/rotation."""
+    model of the scene graph with its translation/rotation. Any damage in the
+    file raises ValueError."""
     if data[:4] != b"VOX ":
         raise ValueError("Not a MagicaVoxel .vox file")
+    try:
+        return _read_vox(data)
+    except (struct.error, IndexError, KeyError, ValueError, RecursionError) as e:
+        raise ValueError(f"Damaged .vox file: {e}") from e
+
+
+def _read_vox(data):
+    if data[8:12] != b"MAIN":
+        raise ValueError("no MAIN chunk")
     p, size, models, nodes, rgba = 8, (0, 0, 0), [], {}, None
     while p + 12 <= len(data):
         cid = data[p:p + 4]
         n, m = struct.unpack_from("<ii", data, p + 4)
         c = p + 12
+        if n < 0 or m < 0 or c + n + m > len(data):
+            raise ValueError(f"chunk {cid!r} is truncated")
         if cid == b"SIZE":
             size = struct.unpack_from("<3i", data, c)
         elif cid == b"XYZI":
@@ -430,29 +496,36 @@ def read_vox(data):
 
     placed = []
 
-    def walk(nid, rot, t):
+    def walk(nid, rot, t, path):
         node = nodes.get(nid)
         if node is None:
             return
+        if nid in path:
+            raise ValueError("the scene graph has a loop")
+        path = path | {nid}
         if node[0] == "T":
             fr = node[2]
             r = _vox_rot(int(fr["_r"])) if "_r" in fr else np.eye(3, dtype=np.int64)
             tn = np.array([int(x) for x in fr["_t"].split()], np.int64) if "_t" in fr else np.zeros(3, np.int64)
-            walk(node[1], rot @ r, rot @ tn + t)
+            if tn.shape != (3,):
+                raise ValueError("bad translation")
+            walk(node[1], rot @ r, rot @ tn + t, path)
         elif node[0] == "G":
             for ch in node[1]:
-                walk(ch, rot, t)
+                walk(ch, rot, t, path)
         else:
             for mid in node[1]:
+                if not 0 <= mid < len(models):
+                    raise ValueError(f"shape refers to missing model {mid}")
                 (sx, sy, sz), v = models[mid]
                 # ponytail: pivot = size // 2; rotated even-sized models may land 1 voxel off
                 placed.append(((v[:, :3] - (sx // 2, sy // 2, sz // 2)) @ rot.T + t, v[:, 3]))
     if nodes:
-        walk(0, np.eye(3, dtype=np.int64), np.zeros(3, np.int64))
+        walk(0, np.eye(3, dtype=np.int64), np.zeros(3, np.int64), frozenset())
     else:
         placed = [(v[:, :3], v[:, 3]) for _, v in models]
     cells = {}
-    if placed:
+    if sum(len(b) for _, b in placed):
         pos = np.concatenate([a for a, _ in placed])
         col = np.concatenate([b for _, b in placed])
         pos -= pos.min(0)
@@ -568,8 +641,9 @@ _drawing = False
 _state = {"area": 0, "hover": None, "size": 1.0, "mode": 'ATTACH', "float": None,
           "rect": None, "bounds": None, "pick": False, "gizmo_hover": None, "line": None}
 # Own undo history: entries are ({cell: [old_colour, new_colour]}, voxel_size),
-# colour 0 = empty. "rev" is the object revision produced by our own last change.
-_hist = {"undo": [], "redo": [], "rev": None}
+# colour 0 = empty. "rev" is the revision of object "obj" (name) produced by our
+# own last change: while they match, the history applies (even between sessions).
+_hist = {"undo": [], "redo": [], "rev": None, "obj": None}
 _sel = set()   # selected cells
 _clip = {}     # copied voxels, relative to their lowest corner
 MAX_HISTORY = 100
@@ -586,7 +660,7 @@ STATUS = "VoxelDraw: shortcuts in the legend at the bottom left (H hides it)    
 LEGEND = (
     "LMB draw    Ctrl+LMB erase    RMB pick colour    Shift+RMB replace colour",
     "1-5 Attach/Erase/Move/Paint/Select    B brush    Ctrl+RMB shape    Ctrl+Wheel size    "
-    "Shift+LMB rotate    Ctrl+F fill",
+    "Shift+LMB rotate    Ctrl+F fill    M live mirror",
     "Select: LMB click/drag (Shift add, Ctrl remove)    A all    Alt+A none    "
     "L linked    C same colour",
     "Move: drag a gizmo arrow (axis) or its centre (free)    X / Y / Z lock the drag axis",
@@ -630,10 +704,20 @@ def session_size(obj, vs):
     return float(obj["_vd_size"]) if "_vd_size" in obj else vs.voxel_size
 
 
-def push_history(changes, size):
+def history_valid(obj):
+    """True if the undo history ends at the voxels currently stored on obj."""
+    return _hist["obj"] == obj.name and _hist["rev"] == int(obj.get("_vd_rev", 0))
+
+
+def push_history(obj, changes, size, rev):
+    """Record a change that took obj to revision `rev`. Older steps are dropped
+    if the voxels were changed by someone else (Blender undo, other object)."""
+    if not (_hist["obj"] == obj.name and _hist["rev"] == rev - 1):
+        _hist["undo"].clear()
     _hist["undo"].append((changes, size))
     del _hist["undo"][:-MAX_HISTORY]
     _hist["redo"].clear()
+    _hist.update(rev=rev, obj=obj.name)
 
 
 def commit(scene, obj, cells, changes, size):
@@ -646,8 +730,7 @@ def commit(scene, obj, cells, changes, size):
         else:
             cells.pop(c, None)
     rebuild_mesh(obj, cells, size, palette_array(scene))
-    _hist["rev"] = save_cells(obj, cells, size)
-    push_history(changes, size)
+    push_history(obj, changes, size, save_cells(obj, cells, size))
 
 
 def selection_action(vs, cells, action, axis=0, ccw=False, delta=(0, 0, 0)):
@@ -673,8 +756,9 @@ def selection_action(vs, cells, action, axis=0, ccw=False, delta=(0, 0, 0)):
     if action == 'PAINT':
         k = vs.color_index
         return {c: [cells[c], k] for c in sel if cells[c] != k}
-    if action == 'MIRROR':  # mirrored copy across the plane of the first voxel
-        changes, moved = transform(cells, sel, lambda c: mirror_cell(c, axis), keep=True)
+    if action == 'MIRROR':  # mirrored copy across the live mirror plane
+        s = mirror_sums(vs)[axis]
+        changes, moved = transform(cells, sel, lambda c: mirror_cell(c, axis, s), keep=True)
         _sel.update(moved)
         return changes
     if action == 'ROTATE':
@@ -934,10 +1018,15 @@ class VoxelSettings(bpy.types.PropertyGroup):
         description="Brush rotation, clockwise (Shift+LMB)")
     fill: bpy.props.BoolProperty(name="Fill", default=False, update=_redraw,
                                  description="Filled shapes / boxes instead of outlines (Ctrl+F)")
+    mirror_live: bpy.props.BoolProperty(
+        name="Live Mirror", default=False, update=_redraw,
+        description="While drawing, every brush (Shape, Box, Line, Face, Fill) also "
+                    "builds the mirrored part (M)")
     mirror: bpy.props.BoolVectorProperty(
-        name="Mirror", size=3, subtype='XYZ', update=_redraw,
-        description="Live symmetry across the planes through the first voxel "
-                    "(the one spawned on the 3D cursor)")
+        name="Mirror Axes", size=3, subtype='XYZ', default=(True, False, False), update=_redraw,
+        description="Axes of the live mirror. The plane goes through the first voxel "
+                    "(the one spawned on the 3D cursor), or through the model centre "
+                    "when Limit Model Size is on")
     move_axis: bpy.props.EnumProperty(
         name="Axis", items=MOVE_AXIS_ITEMS, default='FREE', update=_redraw,
         description="Move mode: axis used when dragging outside the gizmo arrows")
@@ -977,7 +1066,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         vs = context.scene.voxel_settings
         ensure_palette(vs)
         obj = ensure_session_object(context)
-        if "_vd_cells" not in obj:  # new or cleared session
+        keep = history_valid(obj)  # e.g. Clear / Import done while no session ran
+        if "_vd_cells" not in obj and not keep:  # new session (a cleared one stays undoable)
             place_first_voxel(context, obj, vs)
         ensure_material(obj)
         activate_object(context, obj)
@@ -996,7 +1086,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         self.last_build = 0.0
         self.editing = None  # forces the first mode transition
         _sel.clear()
-        _hist.update(undo=[], redo=[], rev=int(obj.get("_vd_rev", 0)))
+        if not keep:
+            _hist.update(undo=[], redo=[], rev=int(obj.get("_vd_rev", 0)), obj=obj.name)
         _state.update(area=context.area.as_pointer(), hover=None, size=1.0, float=None, rect=None)
         _drawing = True
         wm = context.window_manager
@@ -1015,10 +1106,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             self.face_key = None
             _sel.intersection_update(self.cells)
             _state["bounds"] = self.bounds
-            if rev != _hist["rev"]:  # not one of our own changes: history is stale
-                _hist["undo"].clear()
-                _hist["redo"].clear()
-                _hist["rev"] = rev
+            if not history_valid(obj):  # not one of our own changes: history is stale
+                _hist.update(undo=[], redo=[], rev=rev, obj=obj.name)
 
     def _size_for(self, obj, vs):
         if self.cells and "_vd_size" in obj:
@@ -1069,9 +1158,16 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
 
     def _brush_cells(self, vs, mode, o, d):
         """Cells the brush would affect under the ray (the preview), or None."""
-        brush = vs.brush
         if mode == 'MOVE':
             return None
+        cells = self._stroke_cells(vs, mode, o, d)
+        if not cells or mode == 'SELECT':
+            return cells
+        return mirrored(vs, cells)
+
+    def _stroke_cells(self, vs, mode, o, d):
+        """_brush_cells without the live mirror."""
+        brush = vs.brush
         if mode == 'SELECT' or brush == 'FILL':
             hit = self._hit(o, d)
             return [hit[0]] if hit else None
@@ -1091,7 +1187,7 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             end = plane_cell(o, d, start, axis, self.size)
             if end is None:
                 return _state["hover"]
-            cells = line_cells(start, end) if brush == 'LINE' else box_cells(start, end, axis, vs.fill)
+            return line_cells(start, end) if brush == 'LINE' else box_cells(start, end, axis, vs.fill)
         else:
             snap = self.stroke and mode == 'ATTACH' and not vs.tentacle
             pool, bnds = (self.snapshot, self.snap_bounds) if snap else (self.cells, self.bounds)
@@ -1099,11 +1195,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             if hit is None:
                 return None
             if brush in ('BOX', 'LINE'):
-                cells = [hit[0]]
-            else:
-                cells = stamp_cells(*hit, vs.shape, vs.brush_size, vs.rotation, vs.fill)
-        axes = [i for i, on in enumerate(vs.mirror) if on]
-        return mirror_cells(cells, axes) if axes else cells
+                return [hit[0]]
+            return stamp_cells(*hit, vs.shape, vs.brush_size, vs.rotation, vs.fill)
 
     def _set_hover(self, context, cells, mode):
         if cells != _state["hover"] or self.size != _state["size"] or mode != _state["mode"]:
@@ -1160,8 +1253,7 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         self.dirty = False
         self._rebuild(context, obj)
         self.rev = save_cells(obj, self.cells, self.size)
-        _hist["rev"] = self.rev
-        push_history(self.changes, self.size)
+        push_history(obj, self.changes, self.size, self.rev)
 
     def _history(self, context, obj, redo):
         self._sync(obj)
@@ -1216,7 +1308,10 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         elif vs.brush == 'FILL':
             hit = self._hit(o, d)
             if hit:
-                region_cells = flood(self.cells, hit[0], same_color=True)
+                region_cells = set()
+                for start in mirrored(vs, [hit[0]]):
+                    if start in self.cells and start not in region_cells:
+                        region_cells |= flood(self.cells, start, same_color=True)
                 self._apply(context, obj, vs, region_cells, 'ERASE' if mode == 'ERASE' else 'PAINT')
         elif vs.brush == 'FACE':
             cells = self._brush_cells(vs, mode, o, d)
@@ -1341,6 +1436,9 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             return True
         if t == 'F' and ctrl:
             vs.fill = not vs.fill
+            return True
+        if t == 'M' and not (ctrl or alt or shift):
+            vs.mirror_live = not vs.mirror_live
             return True
         if t in AXIS_KEYS and vs.mode == 'MOVE' and not (ctrl or alt or shift):
             vs.move_axis = 'FREE' if vs.move_axis == t else t
@@ -1562,7 +1660,7 @@ class _SessionOp:
 class VOXELDRAW_OT_clear(_SessionOp, bpy.types.Operator):
     bl_idname = "voxeldraw.clear"
     bl_label = "Clear"
-    bl_description = "Delete all voxels of the current session (Ctrl+Z restores them)"
+    bl_description = "Delete all voxels of the current session (Ctrl+Z while drawing restores them)"
 
     def execute(self, context):
         vs = context.scene.voxel_settings
@@ -1666,8 +1764,8 @@ class VOXELDRAW_OT_palette_remove(bpy.types.Operator):
             return {'CANCELLED'}
         vs.palette.remove(k)
         if cells:  # indices above k shift down; old undo steps would point to the wrong colours
-            _hist.update(undo=[], redo=[])
-            _hist["rev"] = save_cells(obj, remap_removed_color(cells, k), session_size(obj, vs))
+            rev = save_cells(obj, remap_removed_color(cells, k), session_size(obj, vs))
+            _hist.update(undo=[], redo=[], rev=rev, obj=obj.name)
             refresh_session(None, context)
         new_clip = remap_removed_color(_clip, k)
         _clip.clear()
@@ -1711,7 +1809,7 @@ class VOXELDRAW_OT_load_palette(bpy.types.Operator, ImportHelper):
                 bpy.data.images.remove(img)
                 pal = [(0.0, 0.0, 0.0)] + [tuple(c) for c in row.tolist()]
                 pal += default_palette()[len(pal):]
-        except (OSError, ValueError, RuntimeError, struct.error) as e:
+        except (OSError, ValueError, RuntimeError) as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
         vs = context.scene.voxel_settings
@@ -1731,8 +1829,11 @@ class VOXELDRAW_OT_import_vox(bpy.types.Operator, ImportHelper):
         try:
             with open(self.filepath, "rb") as f:
                 new, pal = read_vox(f.read())
-        except (OSError, ValueError, struct.error) as e:
+        except (OSError, ValueError) as e:
             self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        if not new:  # would silently wipe the session
+            self.report({'ERROR'}, "The file contains no voxels")
             return {'CANCELLED'}
         scene = context.scene
         vs = scene.voxel_settings
@@ -1788,14 +1889,13 @@ class VOXELDRAW_OT_confirm(_SessionOp, bpy.types.Operator):
         global _drawing
         vs = context.scene.voxel_settings
         obj = vs.target
+        if obj.mode != 'OBJECT' and context.view_layer.objects.active != obj:
+            self.report({'ERROR'}, "Leave Edit Mode first")
+            return {'CANCELLED'}  # before touching anything: the session goes on
         _drawing = False  # the modal operator notices and stops
-        _hist.update(undo=[], redo=[], rev=None)
+        _hist.update(undo=[], redo=[], rev=None, obj=None)
         _sel.clear()
-
         if obj.mode != 'OBJECT':
-            if context.view_layer.objects.active != obj:
-                self.report({'ERROR'}, "Leave Edit Mode first")
-                return {'CANCELLED'}
             bpy.ops.object.mode_set(mode='OBJECT')
 
         tmp = bpy.data.meshes.get(TMP_MESH)
@@ -1907,8 +2007,10 @@ class VOXELDRAW_PT_brush(_Panel, bpy.types.Panel):
         col.prop(vs, "rotation")
         layout.prop(vs, "fill")
         row = layout.row(align=True)
-        row.label(text="Mirror")
-        row.prop(vs, "mirror", text="", toggle=True)
+        row.prop(vs, "mirror_live", text="Live Mirror", toggle=True, icon='MOD_MIRROR')
+        axes = row.row(align=True)
+        axes.active = vs.mirror_live
+        axes.prop(vs, "mirror", text="", toggle=True)
         layout.prop(vs, "use_limit")
         col = layout.column(align=True)
         col.enabled = vs.use_limit
@@ -1990,6 +2092,49 @@ def _draw_cubes(shader, cells, size, color):
         _lines(shader, pts, color, idx)
 
 
+def _toward_viewer(rv3d, obj, pts, amount):
+    """Move object-space points `amount` toward the viewer: a depth bias, so ghost
+    edges lying on voxel edges are not half hidden by the faces next to them."""
+    inv = obj.matrix_world.inverted_safe()
+    if rv3d.is_perspective:
+        d = np.array(inv @ rv3d.view_matrix.inverted().translation, np.float32) - pts
+    else:
+        d = np.broadcast_to(np.array(inv.to_3x3() @ (rv3d.view_rotation @ Vector((0, 0, 1))),
+                                     np.float32), pts.shape)
+    n = np.linalg.norm(d, axis=1)[:, None]
+    return pts + d / np.maximum(n, 1e-9) * amount
+
+
+def _draw_ghost(rv3d, obj, cells, size, color, xray=False):
+    """Voxels about to be placed / erased / painted / moved: translucent fill,
+    see-through hint, thick outline with a contrasting halo."""
+    tris, segs = ghost_geometry(cells)
+    if not len(segs):
+        return
+    segs = _toward_viewer(rv3d, obj, segs * size, 0.02 * size)
+    flat = gpu.shader.from_builtin('UNIFORM_COLOR')
+    flat.bind()
+    gpu.state.depth_test_set('NONE')
+    _lines(flat, segs, (*color[:3], 0.25))  # parts hidden behind voxels
+    if not xray:
+        gpu.state.depth_test_set('LESS_EQUAL')
+    batch = batch_for_shader(flat, 'TRIS', {"pos": tris * size})
+    flat.uniform_float("color", (*color[:3], 0.18))
+    batch.draw(flat)
+
+    s = bpy.context.preferences.system.ui_scale
+    dark = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2] < 0.3
+    wide = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    wide.bind()
+    wide.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+    batch = batch_for_shader(wide, 'LINES', {"pos": segs})
+    for width, col in ((5.0, (1, 1, 1, 0.6) if dark else (0, 0, 0, 0.6)), (2.5, (*color[:3], 1))):
+        wide.uniform_float("lineWidth", width * s)
+        wide.uniform_float("color", col)
+        batch.draw(wide)
+    gpu.state.depth_test_set('LESS_EQUAL')
+
+
 def _draw_box(shader, lo, hi, size, color):
     lo = np.array(lo, np.float32)
     _lines(shader, (lo + CUBE_CORNERS * (np.array(hi, np.float32) - lo)) * size, color, CUBE_LINES)
@@ -2047,8 +2192,16 @@ def draw_preview():
             lo, hi = _state["bounds"]
             _draw_box(shader, lo, [h + 1 for h in hi], size, (1, 1, 1, 0.2))
 
-    if _sel:
+    for a, corners in mirror_planes(vs, _state["bounds"]):
+        quad = np.array(corners, np.float32) * size
+        batch = batch_for_shader(shader, 'TRIS', {"pos": quad}, indices=((0, 1, 2), (2, 3, 0)))
+        shader.uniform_float("color", (*AXIS_COLORS[a][:3], 0.08))
+        batch.draw(shader)
+        _lines(shader, quad, (*AXIS_COLORS[a][:3], 0.6), ((0, 1), (1, 2), (2, 3), (3, 0)))
+
+    if _sel:  # placed voxels: thin outline
         _draw_cubes(shader, _sel, size, (1, 0.55, 0, 1))
+    rv3d = context.region_data
     cells = _state["hover"]
     if cells:
         if _state["mode"] == 'ERASE':
@@ -2057,10 +2210,9 @@ def draw_preview():
             color = (1, 1, 1, 1)
         else:
             color = (*vs.palette[vs.color_index].color, 1)
-        _draw_cubes(shader, cells, size, color)
-    if _state["float"]:
-        gpu.state.depth_test_set('NONE')  # moving voxels stay visible through the model
-        _draw_cubes(shader, _state["float"], size, (0.2, 0.9, 1, 1))
+        _draw_ghost(rv3d, obj, cells, size, color)
+    if _state["float"]:  # moving voxels stay visible through the model
+        _draw_ghost(rv3d, obj, _state["float"], size, (0.2, 0.9, 1, 1), xray=True)
 
     gpu.matrix.pop()
     gpu.state.depth_mask_set(True)
@@ -2070,7 +2222,7 @@ def draw_preview():
 
 def legend_lines(vs):
     shape = f"{vs.shape.title()} {vs.brush_size}" if vs.brush == 'SHAPE' else vs.brush.title()
-    mirror = "".join(a for a, on in zip("XYZ", vs.mirror) if on) or "-"
+    mirror = "".join("XYZ"[a] for a in live_mirror_axes(vs)) or "off"
     mode = f"Move {vs.move_axis.title()}" if vs.mode == 'MOVE' else vs.mode.title()
     head = (f"{mode}  |  {shape}{'  fill' if vs.fill else ''}  |  Mirror {mirror}  |  "
             f"Colour {vs.color_index}  |  Selected {len(_sel)}")
@@ -2156,6 +2308,7 @@ def _on_load(_dummy):
     global _drawing
     _drawing = False  # modal operators do not survive a file load
     _sel.clear()
+    _hist.update(undo=[], redo=[], rev=None, obj=None)  # it belonged to the previous file
 
 
 classes = (
