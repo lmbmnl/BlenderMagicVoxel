@@ -14,6 +14,9 @@ MagicaVoxel-style voxel editor inside Blender 5.x: draw coloured voxels directly
 - `.vox` import / export with palette
 - Greedy meshing on Confirm, voxel size in scene units
 - Own undo / redo, shortcut legend in the viewport
+- Viewport panels (RetopoFlow style) while drawing: Tools, Brush, Session, Symmetry, Palette
+  (resizable), Selection, Scene, Shortcuts. Drag a header to move a panel, ▾ to collapse it;
+  places and sizes are saved in the .blend. U hides them, the sidebar panels stay available
 
 ## Install
 
@@ -25,11 +28,13 @@ blender --command extension build --source-dir . --output-dir ..
 ```
 
 Then open the **VoxelDraw** tab in the 3D View sidebar (N) and press **Start Voxel**.
+Esc (or Exit in the Session panel) stops the tool; Start Voxel resumes the session.
 
 ## Tests
 
 ```
 blender -b --factory-startup --python test_voxeldraw.py
+blender -b --factory-startup --python test_vd_ui.py
 ```
 
 ## Inspiration

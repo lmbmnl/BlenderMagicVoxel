@@ -11,8 +11,11 @@
 # handled by the tool itself (delta history). Selection, move, rotate and flip
 # work on whole cells, so everything always stays on the voxel grid.
 
+import colorsys
+import json
 import struct
 import time
+import traceback
 from functools import lru_cache
 from itertools import product
 from math import atan2, ceil, cos, floor, inf, pi, sin
@@ -28,6 +31,9 @@ from bpy_extras.view3d_utils import (location_3d_to_region_2d, region_2d_to_orig
                                      region_2d_to_vector_3d)
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
+from types import SimpleNamespace
+
+from . import vd_ui
 
 # ---------------------------------------------------------------- pure logic start
 AXIS_ITEMS = [
@@ -702,7 +708,7 @@ AXIS_COLORS = ((0.95, 0.25, 0.3, 1), (0.55, 0.85, 0.2, 1), (0.25, 0.55, 1, 1))
 # key -> (screen axis: 0 right, 1 up, 2 toward the viewer, sign)
 NUDGE = {'RIGHT_ARROW': (0, 1), 'LEFT_ARROW': (0, -1), 'UP_ARROW': (1, 1),
          'DOWN_ARROW': (1, -1), 'PAGE_UP': (2, 1), 'PAGE_DOWN': (2, -1)}
-STATUS = "VoxelDraw: shortcuts in the legend at the bottom left (H hides it)    Tab: pause"
+STATUS = "VoxelDraw: shortcuts in the legend / Shortcuts panel (H)    Tab: pause    Esc: exit"
 LEGEND = (
     "LMB draw    Ctrl+LMB erase    RMB pick colour    Shift+RMB replace colour",
     "1-5 Attach/Erase/Move/Paint/Select    B brush    Ctrl+RMB shape    Ctrl+Wheel size    "
@@ -713,7 +719,7 @@ LEGEND = (
     "Rotate Gizmo: drag a ring (45° steps)",
     "Selection: G move    Shift+D duplicate    R rotate    F / Shift+F flip    "
     "Arrows PgUp PgDn nudge    X delete    P paint    Ctrl+C / Ctrl+V",
-    "Ctrl+Z / Ctrl+Shift+Z undo / redo    Tab pause    H hide legend",
+    "Ctrl+Z / Ctrl+Shift+Z undo / redo    Tab pause    Esc exit    H hide legend    U viewport panels",
 )
 
 
@@ -1092,7 +1098,12 @@ class VoxelSettings(bpy.types.PropertyGroup):
     show_bounds: bpy.props.BoolProperty(
         name="Show Bounds", default=True, update=_redraw,
         description="Draw the model bounding box (or the size limit box)")
-    show_legend: bpy.props.BoolProperty(name="Show Legend", default=True, update=_redraw)
+    show_legend: bpy.props.BoolProperty(name="Show Legend", default=True, update=_redraw,
+                                        description="Shortcut list (H)")
+    viewport_ui: bpy.props.BoolProperty(
+        name="Viewport Panels", default=True, update=_redraw,
+        description="While drawing, show the tool panels inside the 3D viewport (U)")
+    ui_layout: bpy.props.StringProperty(name="Viewport Panel Layout", default="", options={'HIDDEN'})
     tentacle: bpy.props.BoolProperty(
         name="Extrude Mode", default=False,
         description="Pick against the voxels changed during the same stroke: Attach "
@@ -1188,6 +1199,9 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         if not keep:
             _hist.update(undo=[], redo=[], rev=int(obj.get("_vd_rev", 0)), obj=obj.name)
         _state.update(area=context.area.as_pointer(), hover=None, size=1.0, float=None, rect=None)
+        self.exit_requested = False
+        start_viewport_ui(vs)
+        _add_draw_handlers()
         _drawing = True
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.1, window=context.window)
@@ -1606,6 +1620,17 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             return {'PASS_THROUGH'}  # navigation keeps working
         return {'RUNNING_MODAL'}
 
+    def _paste(self, context, region, event, obj, vs):
+        """Clipboard voxels follow the mouse; click to drop them."""
+        if not _clip:
+            return
+        self._sync(obj)
+        o, d = self._ray(region, event, obj)
+        hit = pick_cell(o, d, self.cells, self.bounds, self.size, AXIS_INDEX[vs.axis], vs.z, False)
+        b = hit[0] if hit else (0, 0, 0)
+        floating = {(b[0] + c[0], b[1] + c[1], b[2] + c[2]): k for c, k in _clip.items()}
+        self._grab_start(context, region, event, obj, floating, set())
+
     # -- keyboard
     def _key(self, context, region, event, obj, vs):
         """Keyboard shortcuts (PRESS). Returns True when handled."""
@@ -1616,6 +1641,9 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             return True
         if t == 'B' and not (ctrl or alt):
             vs.brush = _cycle(BRUSH_ITEMS, vs.brush)
+            return True
+        if t == 'U' and not (ctrl or alt or shift):
+            vs.viewport_ui = not vs.viewport_ui
             return True
         if t == 'H' and not (ctrl or alt):
             vs.show_legend = not vs.show_legend
@@ -1652,12 +1680,7 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             selection_action(vs, self.cells, 'COPY')
             return True
         if t == 'V' and ctrl:
-            if _clip:
-                hit = pick_cell(o, d, self.cells, self.bounds, self.size,
-                                AXIS_INDEX[vs.axis], vs.z, False)
-                b = hit[0] if hit else (0, 0, 0)
-                floating = {(b[0] + c[0], b[1] + c[1], b[2] + c[2]): k for c, k in _clip.items()}
-                self._grab_start(context, region, event, obj, floating, set())
+            self._paste(context, region, event, obj, vs)
             return True
         if (t == 'G' and not (ctrl or alt or shift)) or (t == 'D' and shift and not ctrl):
             floating = {c: self.cells[c] for c in _sel if c in self.cells}
@@ -1703,36 +1726,94 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def _finish(self, context):
+        """End the tool. The cleanup at the end runs even if saving the last stroke
+        fails, so no draw handler or timer is ever left behind."""
         global _drawing
-        obj = context.scene.voxel_settings.target
-        if _state["pick"]:
-            pick_end(context)
-        if self.grab is not None or self.spin is not None:
-            self.grab = self.spin = None
-            _state.update(float=None, spin=None)
-        if self.stroke and obj is not None:
-            self._end_stroke(context, obj)
+        try:
+            obj = context.scene.voxel_settings.target
+            if _state["pick"]:
+                pick_end(context)
+            if self.grab is not None or self.spin is not None:
+                self.grab = self.spin = None
+                _state.update(float=None, spin=None)
+            if self.stroke and obj is not None:
+                self._end_stroke(context, obj)
+        except Exception:
+            traceback.print_exc()
         _drawing = False
-        _state.update(hover=None, rect=None)
-        if self._timer is not None:
-            context.window_manager.event_timer_remove(self._timer)
-            self._timer = None
-        context.workspace.status_text_set(None)
-        tag_redraw_all(context)
+        _state.update(hover=None, rect=None, float=None, spin=None, pick=False)
+        stop_viewport_ui()
+        _remove_draw_handlers()
+        try:
+            if self._timer is not None:
+                context.window_manager.event_timer_remove(self._timer)
+            if context.workspace is not None:
+                context.workspace.status_text_set(None)
+            tag_redraw_all(context)
+        except Exception:
+            traceback.print_exc()
+        self._timer = None
         return {'FINISHED'}
 
+    def _exit(self, context):
+        """Esc / Exit: stop the tool and leave Edit Mode; Start Voxel resumes."""
+        obj = context.scene.voxel_settings.target
+        result = self._finish(context)
+        if obj is not None and obj.mode == 'EDIT' and context.view_layer.objects.active == obj:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except RuntimeError:
+                pass
+        return result
+
     def cancel(self, context):
-        if self._timer is not None:
+        """Blender stops the operator (file load, window closed)."""
+        if self._timer is not None or _handles:
             self._finish(context)
+
+    def _ui_event(self, context, event, obj):
+        """Route an event to the viewport panels: 'UI', 'OVER' or None."""
+        vs = context.scene.voxel_settings
+        if _ui is None or not vs.viewport_ui:
+            return None
+        win = ui_region(context.area)
+        if win is None:
+            return None
+        if _ui.capture is None and region_under_mouse(context.area, event) != win:
+            if _ui.leave():
+                context.area.tag_redraw()
+            return None
+        _ui.env = SimpleNamespace(context=context, event=event, region=win, obj=obj, op=self)
+        try:
+            used = _ui.handle(event, event.mouse_x - win.x, event.mouse_y - win.y)
+        finally:
+            _ui.env = None
+        if _ui.redraw or _ui.changed_values:
+            _ui.redraw = False
+            tag_redraw_all(context)
+        return used
 
     # -- modal
     def modal(self, context, event):
+        try:
+            return self._modal(context, event)
+        except Exception:  # never leave a half-dead tool (handlers, timer) behind
+            traceback.print_exc()
+            self.report({'ERROR'}, "VoxelDraw stopped after an internal error (see the system console)")
+            self._finish(context)
+            return {'CANCELLED'}
+
+    def _modal(self, context, event):
         if not _drawing:  # Confirm pressed
             return self._finish(context)
         vs = context.scene.voxel_settings
         obj = vs.target
         if obj is None:
             return self._finish(context)
+        area = context.area
+        if area is None or area.as_pointer() != _state["area"]:
+            # Our viewport is in another workspace (wait for it) or was closed (stop)
+            return {'PASS_THROUGH'} if area_exists(_state["area"]) else self._finish(context)
 
         editing = obj.mode == 'EDIT'
         if editing != self.editing:  # Tab between Edit / Object = resume / pause
@@ -1747,7 +1828,11 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             self.sel_press = None
             _state["rect"] = None
             self._set_editing(context, obj, editing)
-        if not editing or event.type == 'TIMER':
+        if event.type == 'TIMER':
+            if editing and _ui is not None and vs.viewport_ui and _ui.tick():
+                area.tag_redraw()  # a tooltip appears
+            return {'PASS_THROUGH'}
+        if not editing:
             return {'PASS_THROUGH'}
 
         if self.grab is not None:
@@ -1756,6 +1841,26 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             return self._spin_modal(context, event, obj)
         if _state["pick"]:
             return self._pick_modal(context, event, obj, vs)
+
+        if not (self.stroke or self.sel_press):  # viewport panels get the mouse first
+            used = self._ui_event(context, event, obj)
+            if self.exit_requested:
+                return self._exit(context)
+            if used == 'UI':
+                return {'RUNNING_MODAL'}
+            if used == 'OVER':  # mouse over a panel: no brush / gizmo hover behind it
+                if _state["hover"] is not None or _state["ring_hover"] is not None:
+                    _state.update(hover=None, ring_hover=None, gizmo_hover=None)
+                    area.tag_redraw()
+                return {'PASS_THROUGH'}
+
+        if event.type == 'ESC' and event.value == 'PRESS':
+            if self.sel_press:  # cancel the box selection
+                self.sel_press = _state["rect"] = None
+                area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            if not self.stroke:
+                return self._exit(context)
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if self.sel_press:
@@ -2069,6 +2174,19 @@ class VOXELDRAW_OT_export_vox(_SessionOp, bpy.types.Operator, ExportHelper):
         return {'FINISHED'}
 
 
+class VOXELDRAW_OT_reset_ui(bpy.types.Operator):
+    bl_idname = "voxeldraw.reset_ui"
+    bl_label = "Reset Viewport Panels"
+    bl_description = "Put the viewport panels back in their default places and sizes"
+
+    def execute(self, context):
+        context.scene.voxel_settings.ui_layout = ""
+        if _ui is not None:
+            _ui.set_state(None)
+        tag_redraw_all(context)
+        return {'FINISHED'}
+
+
 class VOXELDRAW_OT_confirm(_SessionOp, bpy.types.Operator):
     bl_idname = "voxeldraw.confirm"
     bl_label = "Confirm"
@@ -2175,6 +2293,9 @@ class VOXELDRAW_PT_panel(_Panel, bpy.types.Panel):
         col.prop(vs, "show_bounds")
         col.prop(vs, "show_legend")
         col.prop(vs, "tentacle")
+        row = layout.row(align=True)
+        row.prop(vs, "viewport_ui")
+        row.operator("voxeldraw.reset_ui", text="", icon='LOOP_BACK')
 
 
 class VOXELDRAW_PT_brush(_Panel, bpy.types.Panel):
@@ -2352,6 +2473,13 @@ def _floor_grid(vs, size):
 
 
 def draw_preview():
+    try:
+        _draw_preview()
+    except Exception:
+        _draw_failed()
+
+
+def _draw_preview():
     if not _drawing:
         return
     context = bpy.context
@@ -2484,6 +2612,13 @@ def _draw_rot_gizmo(region, rv3d, obj):
 
 
 def draw_overlay():
+    try:
+        _draw_overlay()
+    except Exception:
+        _draw_failed()
+
+
+def _draw_overlay():
     if not _drawing:
         return
     context = bpy.context
@@ -2511,6 +2646,10 @@ def draw_overlay():
         gpu.state.blend_set('ALPHA')
         _draw_rot_gizmo(context.region, context.region_data, obj)
         gpu.state.blend_set('NONE')
+    if _ui is not None and vs.viewport_ui:
+        if context.region == ui_region(area):  # quad view: panels in one region only
+            draw_viewport_ui(context, area, context.region)
+        return
     if not vs.show_legend:
         return
     scale = context.preferences.system.ui_scale
@@ -2528,10 +2667,380 @@ def draw_overlay():
     blf.disable(0, blf.SHADOW)
 
 
+# ---------------------------------------------------------------- viewport panels (vd_ui)
+# The session's panels drawn inside the viewport. They only read / write the
+# scene settings and call the same operators and functions as the sidebar and
+# the shortcuts, so both stay interchangeable.
+_ui = None            # vd_ui.UI while a session runs
+_painter = None       # vd_ui.GPUPainter, created in the first draw
+_handles = []         # draw handlers of the running session
+_draw_error = [False]
+
+D, G = vd_ui.DAT, vd_ui.GLYPH
+ICONS = {
+    'ATTACH': D("ops.mesh.primitive_cube_add_gizmo"), 'ERASE': D("brush.gpencil_draw.erase"),
+    'MOVE': D("ops.transform.translate"), 'PAINT': D("brush.generic"),
+    'SELECT': D("ops.generic.select_box"),
+    'SHAPE': D("brush.paint_texture.clone"), 'BOX': D("ops.gpencil.primitive_box"),
+    'LINE': D("ops.gpencil.primitive_line"), 'FACE': D("ops.mesh.extrude_region_move"),
+    'FILL': D("brush.paint_texture.fill"),
+    'POINT': G("■"), 'SQUARE': G("□"), 'TRIANGLE': G("△"), 'HEXAGON': G("⬡"),
+    'CIRCLE': G("○"), 'SPHERE': G("●"),
+    'eyedropper': D("ops.paint.eyedropper_add"), 'mirror': D("ops.gpencil.edit_mirror"),
+    'rotate': D("ops.transform.rotate"), 'limit': D("ops.transform.resize.cage"),
+    'grid': D("ops.mesh.primitive_grid_add_gizmo"), 'extrude': D("ops.mesh.extrude_faces_move"),
+    'tools': D("brush.generic"), 'scene': D("ops.generic.cursor"),
+    'undo': G("↶", vd_ui.MONO), 'redo': G("↷", vd_ui.MONO), 'trash': G("🗑"),
+    'confirm': G("✔"), 'exit': G("⏏"), 'add': G("+", vd_ui.MONO), 'all': G("▦"),
+    'none': G("□"), 'brush': G("🖌"), 'copy': G("❐"), 'paste': G("📋"),
+    'import': G("📥"), 'export': G("📤"), 'folder': G("📂", vd_ui.EMOJI),
+    'reset': G("↺", vd_ui.MONO), 'keys': G("⌨"), 'flip': G("⇄", vd_ui.MONO),
+    'bounds': G("⬚"), 'palette': G("🎨", vd_ui.EMOJI), 'replace': G("⇄", vd_ui.MONO),
+    'selection': G("⬚"), 'session': G("⏺"),
+}
+SHORTCUTS = (
+    ("LMB", "draw"), ("Ctrl+LMB", "erase"), ("RMB", "pick colour"),
+    ("Shift+RMB", "replace colour"), ("1 - 5", "Attach Erase Move Paint Select"),
+    ("B", "next brush"), ("Ctrl+RMB", "next shape"), ("Ctrl+Wheel", "brush size"),
+    ("Shift+LMB", "rotate brush"), ("Ctrl+F", "fill"), ("M", "live mirror"),
+    ("A / Alt+A", "select all / none"), ("L / C", "select linked / same colour"),
+    ("G / Shift+D", "move / duplicate"), ("R  F  Shift+F", "rotate / flip"),
+    ("Arrows PgUp PgDn", "nudge"), ("X / P", "delete / paint selection"),
+    ("Ctrl+C / Ctrl+V", "copy / paste"), ("Ctrl+Z  Ctrl+Shift+Z", "undo / redo"),
+    ("Tab", "pause"), ("Esc", "exit the tool"), ("U", "viewport panels"), ("H", "this list"),
+)
+
+
+def _vs():
+    return bpy.context.scene.voxel_settings
+
+
+def _has_cells():
+    obj = _vs().target
+    return obj is not None and "_vd_cells" in obj
+
+
+def _run(env, fn):
+    """Call an operator from a panel: its errors become a warning, not a crash."""
+    try:
+        fn()
+    except RuntimeError as e:
+        env.op.report({'WARNING'}, str(e).replace("Error:", "").strip())
+
+
+def _active_rgb():
+    vs = _vs()
+    return tuple(vs.palette[vs.color_index].color) if vs.color_index < len(vs.palette) else None
+
+
+def _hsv(k):
+    def get():
+        rgb = _active_rgb()
+        return colorsys.rgb_to_hsv(*rgb)[k] if rgb else 0.0
+
+    def set_(v):
+        vs = _vs()
+        rgb = _active_rgb()
+        if rgb is None:
+            return
+        hsv = list(colorsys.rgb_to_hsv(*rgb))
+        hsv[k] = v
+        vs.palette[vs.color_index].color = colorsys.hsv_to_rgb(*hsv)
+    return get, set_
+
+
+def build_viewport_ui():
+    """Panels spread over the viewport: tools on the left, brush next to them,
+    session on top, symmetry top right, palette on the right (resizable),
+    selection at the bottom, scene bottom left, shortcuts bottom right."""
+    B, Row, Col, L, S = vd_ui.Button, vd_ui.Row, vd_ui.Column, vd_ui.Label, vd_ui.Slider
+
+    def radio(attr, value, text, icon=None, tip="", **kw):
+        return B(text, icon=icon, tooltip=tip, active=lambda: getattr(_vs(), attr) == value,
+                 on_click=lambda env: setattr(_vs(), attr, value), **kw)
+
+    def toggle(attr, text, icon=None, tip="", **kw):
+        return B(text, icon=icon, tooltip=tip, active=lambda: bool(getattr(_vs(), attr)),
+                 on_click=lambda env: setattr(_vs(), attr, not getattr(_vs(), attr)), **kw)
+
+    def axis_toggle(attr, i, **kw):
+        def flip(env):
+            vs = _vs()
+            v = list(getattr(vs, attr))
+            v[i] = not v[i]
+            setattr(vs, attr, v)
+        return B("XYZ"[i], active=lambda: getattr(_vs(), attr)[i], on_click=flip, **kw)
+
+    def prop_slider(attr, text, lo, hi, idx=None, **kw):
+        if idx is None:
+            def get():
+                return getattr(_vs(), attr)
+
+            def set_(v):
+                setattr(_vs(), attr, v)
+        else:
+            def get():
+                return getattr(_vs(), attr)[idx]
+
+            def set_(v):
+                vs = _vs()
+                arr = list(getattr(vs, attr))
+                arr[idx] = v
+                setattr(vs, attr, arr)
+        return S(text, get, set_, lo, hi, **kw)
+
+    def op_button(text, icon, call, tip="", **kw):
+        return B(text, icon=icon, tooltip=tip, on_click=lambda env: _run(env, lambda: call(env)), **kw)
+
+    def sel_op(action, axis=0):
+        return lambda env: bpy.ops.voxeldraw.selection(action=action, axis=axis)
+
+    def has_sel():
+        return bool(_sel)
+
+    shape_on = lambda: _vs().brush == 'SHAPE'  # noqa: E731
+
+    # -- left: tools (mode + brush type)
+    tools = vd_ui.Panel("tools", "Tools", Col(
+        L("Mode", small=True, dim=True),
+        *[radio("mode", m, label, ICONS[m], tip, align="LEFT") for m, label, tip in MODE_ITEMS],
+        vd_ui.Separator(),
+        L("Brush", small=True, dim=True),
+        *[radio("brush", b, label, ICONS[b], tip + ("  (B cycles)" if b == 'SHAPE' else ""), align="LEFT")
+          for b, label, tip in BRUSH_ITEMS],
+    ), icon=ICONS['tools'], anchor=(0, 0), offset=(8, 8))
+
+    # -- brush settings, next to the tools
+    brush = vd_ui.Panel("brush", "Brush", Col(
+        Row(*[radio("shape", sh, "", ICONS[sh], f"{label}  (Ctrl+RMB cycles)", enabled=shape_on)
+              for sh, label, _tip in SHAPE_ITEMS], equal=True),
+        prop_slider("brush_size", "Size", 1, 256, min_w=170, enabled=shape_on,
+                    tooltip="Brush size in voxels (Ctrl+Wheel)"),
+        prop_slider("rotation", "Rotation x90°", 0, 3, enabled=shape_on,
+                    tooltip="Brush rotation, clockwise (Shift+LMB)"),
+        toggle("fill", "Fill", ICONS['FILL'], "Filled shapes and boxes instead of outlines (Ctrl+F)"),
+        Col(L("Move axis", small=True, dim=True),
+            Row(*[radio("move_axis", a, label, tip=tip) for a, label, tip in MOVE_AXIS_ITEMS], equal=True),
+            visible=lambda: _vs().mode == 'MOVE'),
+    ), icon=ICONS['SHAPE'], anchor=(0, 0), offset=(150, 8))
+
+    # -- top: session
+    session = vd_ui.Panel("session", "Session", Col(
+        Row(op_button("", ICONS['undo'], lambda env: env.op._history(env.context, env.obj, False),
+                      "Undo (Ctrl+Z)", enabled=lambda: bool(_hist["undo"])),
+            op_button("", ICONS['redo'], lambda env: env.op._history(env.context, env.obj, True),
+                      "Redo (Ctrl+Shift+Z)", enabled=lambda: bool(_hist["redo"])),
+            op_button("Clear", ICONS['trash'], lambda env: bpy.ops.voxeldraw.clear(),
+                      "Delete every voxel (undoable)"),
+            op_button("Confirm", ICONS['confirm'], lambda env: bpy.ops.voxeldraw.confirm(),
+                      "Finish: bake the voxels into a single mesh"),
+            toggle("greedy", "Optimize", None, "On Confirm merge same-colour coplanar faces (greedy mesh)"),
+            B("Exit", icon=ICONS['exit'], tooltip="Stop the tool (Esc). The voxels stay: Start Voxel resumes",
+              on_click=lambda env: setattr(env.op, "exit_requested", True))),
+        L(lambda: legend_lines(_vs())[0], small=True, dim=True, align="CENTER"),
+    ), icon=ICONS['session'], anchor=(0.5, 0), offset=(0, 8))
+
+    # -- top right (left of the navigation gizmo): symmetry and size limit
+    symmetry = vd_ui.Panel("symmetry", "Symmetry", Col(
+        Row(toggle("mirror_live", "Live Mirror", ICONS['mirror'], "Mirror every brush stroke (M)"),
+            *[axis_toggle("mirror", i, enabled=lambda: _vs().mirror_live, tooltip="Mirror axis")
+              for i in range(3)]),
+        toggle("use_limit", "Limit Model Size", ICONS['limit'],
+               "Only add voxels inside 0..size, like a MagicaVoxel model;\nthe mirror plane moves to the model centre"),
+        Row(*[prop_slider("model_size", "XYZ"[i], 1, 256, idx=i, min_w=58, enabled=lambda: _vs().use_limit)
+              for i in range(3)], equal=True),
+    ), icon=ICONS['mirror'], anchor=(1, 0), offset=(96, 8))
+
+    # -- right: palette (resizable)
+    def color_label():
+        vs = _vs()
+        i = vs.color_index
+        return f"{i}  {vs.palette[i].name}" if i < len(vs.palette) else f"{i}  (missing)"
+
+    palette = vd_ui.Panel("palette", "Palette", Col(
+        Row(vd_ui.Swatch(_active_rgb, size=(34, vd_ui.ROW)),
+            L(color_label, flex=True),
+            op_button("", ICONS['eyedropper'], lambda env: bpy.ops.voxeldraw.eyedropper(),
+                      "Pick the colour of a voxel (also RMB)"),
+            op_button("", ICONS['add'], lambda env: bpy.ops.voxeldraw.palette_add(),
+                      "Add a colour (copy of the active one)", enabled=lambda: len(_vs().palette) < 256),
+            op_button("", ICONS['trash'],
+                      lambda env: bpy.ops.voxeldraw.palette_remove(index=_vs().color_index),
+                      "Remove the active colour (only if no voxel uses it)")),
+        vd_ui.ColorGrid(lambda: len(_vs().palette), lambda i: _vs().palette[i].color,
+                        lambda: _vs().color_index, lambda i: setattr(_vs(), "color_index", i),
+                        name=lambda i: _vs().palette[i].name,
+                        tooltip="Click: active colour. Wheel: scroll"),
+        *[S(label, *_hsv(k), 0.0, 1.0, step=0.01, digits=2, enabled=lambda: _active_rgb() is not None,
+            tooltip="Edit the active colour (rename it in the sidebar)")
+          for k, label in enumerate(("Hue", "Saturation", "Value"))],
+        Row(prop_slider("replace_from", "From", 1, 255, tooltip="Palette index to replace", flex=True),
+            op_button("To Active", ICONS['replace'], lambda env: bpy.ops.voxeldraw.replace_color(),
+                      "Recolour every voxel of 'From' with the active colour (Shift+RMB)")),
+        Row(op_button("Default", ICONS['reset'], lambda env: bpy.ops.voxeldraw.reset_palette(),
+                      "Restore the MagicaVoxel palette"),
+            op_button("Load…", ICONS['folder'],
+                      lambda env: bpy.ops.voxeldraw.load_palette('INVOKE_DEFAULT'),
+                      "Palette from a .vox or a 256 x 1 image"), equal=True),
+    ), icon=ICONS['palette'], anchor=(1, 0.5), offset=(8, 40), resizable=True,
+        size=(236, 380), min_size=(170, 230))
+
+    # -- bottom: selection
+    def axis_ops(action, label, icon, tip):
+        return Row(L(label, icon=icon, small=True),
+                   *[op_button("XYZ"[i], None, sel_op(action, i), f"{tip} {'XYZ'[i]}", enabled=has_sel)
+                     for i in range(3)])
+
+    selection = vd_ui.Panel("selection", "Selection", Col(
+        L(lambda: f"{len(_sel)} selected    clipboard {len(_clip)}", small=True, dim=True, align="CENTER"),
+        Row(op_button("All", ICONS['all'], sel_op('ALL'), "Select all (A)"),
+            op_button("None", ICONS['none'], sel_op('NONE'), "Select none (Alt+A)", enabled=has_sel),
+            op_button("Delete", ICONS['trash'], sel_op('DELETE'), "Delete the selection (X)", enabled=has_sel),
+            op_button("Paint", ICONS['brush'], sel_op('PAINT'), "Recolour with the active colour (P)",
+                      enabled=has_sel),
+            op_button("Copy", ICONS['copy'], sel_op('COPY'), "Copy (Ctrl+C)", enabled=has_sel),
+            op_button("Paste", ICONS['paste'],
+                      lambda env: env.op._paste(env.context, env.region, env.event, env.obj, _vs()),
+                      "Paste: the voxels follow the mouse, click to drop (Ctrl+V)",
+                      enabled=lambda: bool(_clip))),
+        Row(axis_ops('MIRROR', "Mirror", ICONS['mirror'], "Mirrored copy across the live mirror plane,"),
+            axis_ops('ROTATE', "Rotate", ICONS['rotate'], "Rotate 90° around"),
+            axis_ops('FLIP', "Flip", ICONS['flip'], "Flip along"),
+            toggle("rotate_gizmo", "Gizmo 45°", ICONS['rotate'],
+                   "Rotation rings on the selection: drag a ring, 45° steps")),
+    ), icon=ICONS['selection'], anchor=(0.5, 1), offset=(0, 8))
+
+    # -- bottom left: scene and files
+    scene = vd_ui.Panel("scene", "Scene", Col(
+        prop_slider("voxel_size", "Voxel Size", 0.001, 100.0, digits=3, log=True, min_w=170, step=0.05,
+                    enabled=lambda: not _has_cells(), tooltip="Locked while the session contains voxels"),
+        Row(L("Floor", small=True), *[radio("axis", a, label, tip=tip) for a, label, tip in AXIS_ITEMS],
+            equal=True),
+        prop_slider("z", "Floor Offset", -100.0, 100.0, digits=2, step=0.5,
+                    tooltip="Floor plane offset along its normal (object space)"),
+        Row(toggle("show_floor", "Grid", ICONS['grid'], "Show the floor grid"),
+            toggle("show_bounds", "Bounds", ICONS['bounds'], "Show the model bounds / size limit"),
+            toggle("tentacle", "Extrude", ICONS['extrude'],
+                   "Strokes pick what they just changed:\nAttach grows on it, Erase digs through"),
+            equal=True),
+        Row(op_button("Import .vox", ICONS['import'],
+                      lambda env: bpy.ops.voxeldraw.import_vox('INVOKE_DEFAULT'),
+                      "Load a MagicaVoxel .vox, replacing the session"),
+            op_button("Export .vox", ICONS['export'],
+                      lambda env: bpy.ops.voxeldraw.export_vox('INVOKE_DEFAULT'),
+                      "Save the session as a MagicaVoxel .vox", enabled=_has_cells), equal=True),
+    ), icon=ICONS['scene'], anchor=(0, 1), offset=(8, 8))
+
+    # -- bottom right: shortcuts (H)
+    keys = vd_ui.Panel("shortcuts", "Shortcuts", Col(
+        *[Row(L(k, small=True, dim=True), L(a, small=True)) for k, a in SHORTCUTS], spacing=0,
+    ), icon=ICONS['keys'], anchor=(1, 1), offset=(8, 8), collapsed=True,
+        visible=lambda: _vs().show_legend)
+
+    return vd_ui.UI([scene, keys, selection, symmetry, session, palette, brush, tools],
+                    on_layout=_save_layout)
+
+
+def _save_layout(state):
+    _vs().ui_layout = json.dumps(state, separators=(",", ":"))
+
+
+def start_viewport_ui(vs):
+    global _ui, _painter
+    _ui, _painter = build_viewport_ui(), None
+    _draw_error[0] = False
+    try:
+        _ui.set_state(json.loads(vs.ui_layout) if vs.ui_layout else None)
+    except (ValueError, TypeError, AttributeError):
+        _ui.set_state(None)
+
+
+def stop_viewport_ui():
+    global _ui, _painter
+    if _ui is not None:
+        _ui.cancel()
+    _ui = _painter = None
+
+
+def ui_region(area):
+    """The viewport region the panels live in (quad view: the main one)."""
+    if area is None or area.type != 'VIEW_3D':
+        return None
+    main = area.spaces.active.region_3d
+    wins = [r for r in area.regions if r.type == 'WINDOW']
+    return next((r for r in wins if r.data == main), wins[-1] if wins else None)
+
+
+def ui_bounds(area, region):
+    """(L, B, R, T) of the region not covered by the toolbar, sidebar or headers
+    drawn over it (Region Overlap), in region pixels."""
+    L, B, R, T = 0, 0, region.width, region.height
+    for r in area.regions:
+        if r.type not in {'TOOLS', 'UI', 'HEADER', 'TOOL_HEADER'} or r.width <= 1 or r.height <= 1:
+            continue
+        x0, x1 = max(r.x, region.x), min(r.x + r.width, region.x + region.width)
+        y0, y1 = max(r.y, region.y), min(r.y + r.height, region.y + region.height)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if r.type in {'TOOLS', 'UI'}:
+            if r.x + r.width / 2 < region.x + region.width / 2:
+                L = max(L, x1 - region.x)
+            else:
+                R = min(R, x0 - region.x)
+        elif r.y + r.height / 2 > region.y + region.height / 2:
+            T = min(T, y0 - region.y)
+        else:
+            B = max(B, y1 - region.y)
+    return L, B, R, T
+
+
+def draw_viewport_ui(context, area, region):
+    global _painter
+    if _painter is None:
+        _painter = vd_ui.GPUPainter()
+    scale = context.preferences.system.ui_scale or 1.0
+    _ui.layout(_painter, ui_bounds(area, region), scale)
+    gpu.state.blend_set('ALPHA')
+    try:
+        _ui.draw(_painter)
+    finally:
+        gpu.state.blend_set('NONE')
+
+
+def _draw_failed():
+    """A draw callback failed: report once per session, hide the panels."""
+    if not _draw_error[0]:
+        _draw_error[0] = True
+        traceback.print_exc()
+    stop_viewport_ui()
+
+
+def _add_draw_handlers():
+    _remove_draw_handlers()
+    _handles.append(bpy.types.SpaceView3D.draw_handler_add(draw_preview, (), 'WINDOW', 'POST_VIEW'))
+    _handles.append(bpy.types.SpaceView3D.draw_handler_add(draw_overlay, (), 'WINDOW', 'POST_PIXEL'))
+
+
+def _remove_draw_handlers():
+    while _handles:
+        h = _handles.pop()
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
+        except (ValueError, RuntimeError, ReferenceError):
+            pass
+
+
+def area_exists(pointer):
+    """Is the area still in some screen (maybe of another workspace)?"""
+    return any(a.as_pointer() == pointer for sc in bpy.data.screens for a in sc.areas)
+
+
 @persistent
 def _on_load(_dummy):
     global _drawing
     _drawing = False  # modal operators do not survive a file load
+    stop_viewport_ui()
+    _remove_draw_handlers()
     _sel.clear()
     _hist.update(undo=[], redo=[], rev=None, obj=None)  # it belonged to the previous file
 
@@ -2551,6 +3060,7 @@ classes = (
     VOXELDRAW_OT_import_vox,
     VOXELDRAW_OT_export_vox,
     VOXELDRAW_OT_confirm,
+    VOXELDRAW_OT_reset_ui,
     VOXELDRAW_UL_palette,
     VOXELDRAW_PT_panel,
     VOXELDRAW_PT_brush,
@@ -2558,26 +3068,20 @@ classes = (
     VOXELDRAW_PT_palette,
     VOXELDRAW_PT_file,
 )
-_handles = []
-
-
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.voxel_settings = bpy.props.PointerProperty(type=VoxelSettings)
-    _handles.append(bpy.types.SpaceView3D.draw_handler_add(draw_preview, (), 'WINDOW', 'POST_VIEW'))
-    _handles.append(bpy.types.SpaceView3D.draw_handler_add(draw_overlay, (), 'WINDOW', 'POST_PIXEL'))
     bpy.app.handlers.load_post.append(_on_load)
 
 
 def unregister():
     global _drawing
     _drawing = False
+    stop_viewport_ui()
+    _remove_draw_handlers()  # a session still running when the add-on is disabled
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
-    for h in _handles:
-        bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
-    _handles.clear()
     del bpy.types.Scene.voxel_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

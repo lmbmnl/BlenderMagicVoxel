@@ -9,9 +9,11 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location(
-    "voxel_draw", os.path.join(os.path.dirname(os.path.abspath(__file__)), "__init__.py"))
+    "voxel_draw", os.path.join(HERE, "__init__.py"), submodule_search_locations=[HERE])
 vd = importlib.util.module_from_spec(spec)
+sys.modules["voxel_draw"] = vd  # package: the add-on imports its vd_ui module
 spec.loader.exec_module(vd)
 
 
