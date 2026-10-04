@@ -10,6 +10,7 @@ MagicaVoxel-style voxel editor inside Blender 5.x: draw coloured voxels directly
   first voxel (spawned on the 3D cursor), or across the model centre when the size limit is on
 - Placement preview with a thick outline, translucent fill and see-through hint
 - Select, move with a snapped gizmo, rotate, flip, mirror, duplicate, copy / paste
+- Rotate gizmo: drag a ring around the selection in 45° steps (90° steps exact, 45° approximated)
 - `.vox` import / export with palette
 - Greedy meshing on Confirm, voxel size in scene units
 - Own undo / redo, shortcut legend in the viewport

@@ -129,6 +129,18 @@ fn = vd.rotate_fn(sel, 2, True)
 assert len({fn(c) for c in sel}) == 4 and vd.bounds_of({fn(c) for c in sel}) == ((0, 0, 0), (1, 2, 0))
 back = vd.rotate_fn({fn(c) for c in sel}, 2, False)
 assert {back(fn(c)): k for c, k in shape.items()} == shape  # CW undoes CCW exactly
+# 45 deg gizmo steps: multiples of 90 are the exact rotations, odd steps resample
+fn = vd.rotate_fn(sel, 2, True)
+assert vd.rotate_cells(shape, 2, 2) == {fn(c): k for c, k in shape.items()}
+cw = vd.rotate_fn(sel, 2, False)
+assert vd.rotate_cells(shape, 2, -2) == vd.rotate_cells(shape, 2, 6) == {cw(c): k for c, k in shape.items()}
+assert vd.rotate_cells(shape, 0, 8) == shape and vd.rotate_cells({(4, 5, 6): 7}, 0, 1) == {(4, 5, 6): 7}
+sq = {(x, y, 3): 1 + (x + y) % 2 for x in range(5) for y in range(5)}
+dia = vd.rotate_cells(sq, 2, 1)
+assert len(dia) == 25 and vd.bounds_of(dia) == ((-1, -1, 3), (5, 5, 3)) and set(dia.values()) == {1, 2}
+assert {(4 - x, y, z) for x, y, z in dia} == set(dia)  # diamond, symmetric
+assert len(vd.rotate_cells({(x, 0, 0): 1 for x in range(6)}, 2, 1)) == 8  # line -> staircase
+assert abs(vd.wrap_angle(7.0) - (7.0 - 2 * np.pi)) < 1e-9 and vd.wrap_angle(np.pi) == np.pi
 ff = vd.flip_fn(sel, 0)
 assert {ff(c): k for c, k in shape.items()} == {(2, 0, 0): 1, (1, 0, 0): 2, (0, 0, 0): 3, (0, 1, 0): 4}
 changes, new_sel = vd.transform(shape, {(0, 0, 0)}, lambda c: (c[0], c[1], c[2] + 1))

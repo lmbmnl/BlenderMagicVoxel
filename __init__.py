@@ -15,7 +15,7 @@ import struct
 import time
 from functools import lru_cache
 from itertools import product
-from math import floor, inf
+from math import atan2, ceil, cos, floor, inf, pi, sin
 
 import blf
 import bmesh
@@ -377,6 +377,51 @@ def flip_fn(sel, axis):
     return lambda c: tuple(lo[i] + hi[i] - c[i] if i == axis else c[i] for i in range(3))
 
 
+def rotate_cells(cells, axis, steps):
+    """{cell: colour} rotated by steps x 45 deg (right hand around axis) about the
+    centre of its bounding box. Multiples of 90 deg are exact (rotate_fn); odd steps
+    can't stay on the grid: every target voxel takes the source voxel under its
+    centre (nearest), so the shape is approximated."""
+    steps %= 8
+    if not cells or steps == 0:
+        return dict(cells)
+    if steps % 2 == 0:
+        cur = dict(cells)
+        for _ in range(1 if steps == 6 else steps // 2):  # 270 deg = one clockwise turn
+            fn = rotate_fn(set(cur), axis, steps != 6)
+            cur = {fn(c): k for c, k in cur.items()}
+        return cur
+    b, c = (axis + 1) % 3, (axis + 2) % 3
+    lo, hi = bounds_of(cells)
+    cb, cc = (lo[b] + hi[b] + 1) / 2, (lo[c] + hi[c] + 1) / 2
+    hb, hc = (hi[b] - lo[b] + 1) / 2, (hi[c] - lo[c] + 1) / 2
+    co, si = cos(steps * pi / 4), sin(steps * pi / 4)
+    rb, rc = abs(co) * hb + abs(si) * hc, abs(si) * hb + abs(co) * hc  # rotated half extents
+    ta, tb, tc = np.meshgrid(np.arange(lo[axis], hi[axis] + 1),
+                             np.arange(floor(cb - rb), ceil(cb + rb)),
+                             np.arange(floor(cc - rc), ceil(cc + rc)), indexing='ij')
+    u, v = tb.ravel() + 0.5 - cb, tc.ravel() + 0.5 - cc
+    dst = np.empty((u.size, 3), np.int64)
+    dst[:, axis], dst[:, b], dst[:, c] = ta.ravel(), tb.ravel(), tc.ravel()
+    src = dst.copy()
+    src[:, b] = np.floor(cb + co * u + si * v)  # inverse rotation of the target centre
+    src[:, c] = np.floor(cc - si * u + co * v)
+    pos = np.array(list(cells), np.int64)
+    col = np.fromiter(cells.values(), np.int64, len(cells))
+    keys = _keys(pos)
+    order = np.argsort(keys)
+    sk = keys[order]
+    k = _keys(src)
+    idx = np.minimum(np.searchsorted(sk, k), len(sk) - 1)
+    hit = sk[idx] == k
+    return {tuple(p): v for p, v in zip(dst[hit].tolist(), col[order][idx[hit]].tolist())}
+
+
+def wrap_angle(a):
+    """Angle in (-pi, pi]."""
+    return a - 2 * pi * ceil((a - pi) / (2 * pi))
+
+
 def transform(cells, sel, fn, keep=False):
     """Move the selected voxels through fn (overwriting what is there).
     Returns ({cell: [old, new]}, new selection)."""
@@ -639,6 +684,7 @@ def plane_cell(o, d, start, axis, size):
 
 _drawing = False
 _state = {"area": 0, "hover": None, "size": 1.0, "mode": 'ATTACH', "float": None,
+          "ring_hover": None, "spin": None,
           "rect": None, "bounds": None, "pick": False, "gizmo_hover": None, "line": None}
 # Own undo history: entries are ({cell: [old_colour, new_colour]}, voxel_size),
 # colour 0 = empty. "rev" is the revision of object "obj" (name) produced by our
@@ -663,7 +709,8 @@ LEGEND = (
     "Shift+LMB rotate    Ctrl+F fill    M live mirror",
     "Select: LMB click/drag (Shift add, Ctrl remove)    A all    Alt+A none    "
     "L linked    C same colour",
-    "Move: drag a gizmo arrow (axis) or its centre (free)    X / Y / Z lock the drag axis",
+    "Move: drag a gizmo arrow (axis) or its centre (free)    X / Y / Z lock the drag axis    "
+    "Rotate Gizmo: drag a ring (45° steps)",
     "Selection: G move    Shift+D duplicate    R rotate    F / Shift+F flip    "
     "Arrows PgUp PgDn nudge    X delete    P paint    Ctrl+C / Ctrl+V",
     "Ctrl+Z / Ctrl+Shift+Z undo / redo    Tab pause    H hide legend",
@@ -822,6 +869,52 @@ def gizmo_hit(giz, mouse):
     if best is not None and seg_dist(mouse, c2, ends[best]) < 9 * s:
         return best
     return None
+
+
+def rot_gizmo_screen(region, rv3d, obj, cells, size):
+    """Rotate gizmo in region pixels: (centre, {axis: closed ring points}) around the
+    centre of `cells`, or None. Rings are drawn outside the move arrows."""
+    if not cells:
+        return None
+    lo, hi = bounds_of(cells)
+    c_local = Vector([(lo[i] + hi[i] + 1) / 2 * size for i in range(3)])
+    mw = obj.matrix_world
+    c2 = location_3d_to_region_2d(region, rv3d, mw @ c_local)
+    if c2 is None:
+        return None
+    right = mw.to_3x3().inverted_safe() @ (rv3d.view_rotation @ Vector((1, 0, 0)))
+    p2 = location_3d_to_region_2d(region, rv3d, mw @ (c_local + right.normalized()))
+    if p2 is None or (p2 - c2).length < 1e-6:
+        return None
+    radius = 125 * bpy.context.preferences.system.ui_scale / (p2 - c2).length  # local units
+    rings = {}
+    for a in range(3):
+        b, c = (a + 1) % 3, (a + 2) % 3
+        pts = []
+        for i in range(65):
+            t = 2 * pi * i / 64
+            p = c_local.copy()
+            p[b] += radius * cos(t)
+            p[c] += radius * sin(t)
+            q = location_3d_to_region_2d(region, rv3d, mw @ p)
+            if q is None:
+                break
+            pts.append(q)
+        else:
+            rings[a] = pts
+    return c2, rings
+
+
+def ring_hit(giz, mouse):
+    """Axis of the gizmo ring under the mouse, or None."""
+    if giz is None:
+        return None
+    best, dist = None, 8 * bpy.context.preferences.system.ui_scale
+    for a, pts in giz[1].items():
+        d = min(seg_dist(mouse, pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+        if d < dist:
+            best, dist = a, d
+    return best
 
 
 def ensure_palette(vs):
@@ -1027,6 +1120,11 @@ class VoxelSettings(bpy.types.PropertyGroup):
         description="Axes of the live mirror. The plane goes through the first voxel "
                     "(the one spawned on the 3D cursor), or through the model centre "
                     "when Limit Model Size is on")
+    rotate_gizmo: bpy.props.BoolProperty(
+        name="Rotate Gizmo", default=False, update=_redraw,
+        description="Show rotation rings at the centre of the selection: drag a ring to "
+                    "rotate around its axis in 45° steps. 90° steps are exact, odd 45° "
+                    "steps approximate the shape (voxels can't sit at 45°)")
     move_axis: bpy.props.EnumProperty(
         name="Axis", items=MOVE_AXIS_ITEMS, default='FREE', update=_redraw,
         description="Move mode: axis used when dragging outside the gizmo arrows")
@@ -1080,7 +1178,7 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         self.changes = {}
         self.cells, self.bounds = {}, None
         self.snapshot, self.snap_bounds = set(), None
-        self.drag = self.grab = self.sel_press = self.face_key = self.face_cells = None
+        self.drag = self.grab = self.spin = self.sel_press = self.face_key = self.face_cells = None
         self.rev = -1
         self.size = 1.0
         self.last_build = 0.0
@@ -1234,6 +1332,16 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
     def _step(self, context, region, event, obj, vs, deleting):
         o, d = self._ray(region, event, obj)
         mode = vs.mode if vs.mode in ('SELECT', 'MOVE') else ('ERASE' if deleting else vs.mode)
+        ring = None
+        if vs.rotate_gizmo and _sel and not self.stroke:
+            ring = ring_hit(rot_gizmo_screen(region, region.data, obj, _sel, self.size),
+                            Vector((event.mouse_x - region.x, event.mouse_y - region.y)))
+        if ring != _state["ring_hover"]:
+            _state["ring_hover"] = ring
+            context.area.tag_redraw()
+        if ring is not None:  # a click here rotates: no brush preview
+            self._set_hover(context, None, mode)
+            return
         if mode == 'MOVE':  # highlight the gizmo part under the mouse
             h = gizmo_hit(gizmo_screen(region, region.data, obj, _sel, self.size),
                           Vector((event.mouse_x - region.x, event.mouse_y - region.y)))
@@ -1281,6 +1389,12 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
     def _press(self, context, region, event, obj, vs):
         self._sync(obj)
         self.size = self._size_for(obj, vs)
+        if vs.rotate_gizmo and _sel:
+            axis = ring_hit(rot_gizmo_screen(region, region.data, obj, _sel, self.size),
+                            Vector((event.mouse_x - region.x, event.mouse_y - region.y)))
+            if axis is not None:
+                self._spin_start(context, region, event, obj, axis)
+                return
         if vs.mode == 'SELECT':
             op = 'ADD' if event.shift else 'SUB' if event.ctrl else 'SET'
             self.sel_press = (event.mouse_x - region.x, event.mouse_y - region.y, op, region)
@@ -1420,6 +1534,75 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             return {'PASS_THROUGH'}  # navigation keeps working
         return {'RUNNING_MODAL'}
 
+    # -- rotate gizmo: drag a ring around the selection centre, 45 deg steps
+    def _screen_angle(self, region, event, obj):
+        c2 = location_3d_to_region_2d(region, region.data,
+                                      obj.matrix_world @ Vector(self.spin["centre"]))
+        if c2 is None:
+            return None
+        x, y = event.mouse_x - region.x - c2.x, event.mouse_y - region.y - c2.y
+        return atan2(y, x) if x * x + y * y > 25 else None  # unstable near the centre
+
+    def _spin_start(self, context, region, event, obj, axis):
+        sel = {c: self.cells[c] for c in _sel if c in self.cells}
+        if not sel:
+            return
+        lo, hi = bounds_of(sel)
+        toward = obj.matrix_world.to_3x3().inverted_safe() @ (
+            region.data.view_rotation @ Vector((0, 0, 1)))
+        # screen counter-clockwise = right hand around the axis when it points at the viewer
+        self.spin = {"cells": sel, "axis": axis, "result": sel, "steps": 0, "total": 0.0,
+                     "sign": 1 if toward[axis] >= 0 else -1, "last": None,
+                     "centre": [(lo[i] + hi[i] + 1) / 2 * self.size for i in range(3)]}
+        self.spin["last"] = self._screen_angle(region, event, obj)
+        _state.update(hover=None, float=list(sel), spin=(axis, 0))
+        context.workspace.status_text_set(
+            "Rotate: drag around the centre (45° steps)    release: confirm    RMB / Esc: cancel")
+        tag_redraw_all(context)
+
+    def _spin_update(self, region, event, obj):
+        sp = self.spin
+        a = self._screen_angle(region, event, obj)
+        if a is None:
+            return
+        if sp["last"] is not None:
+            sp["total"] += wrap_angle(a - sp["last"])
+        sp["last"] = a
+        steps = round(sp["total"] * sp["sign"] / (pi / 4))
+        if steps != sp["steps"]:  # always from the original voxels: 90 deg stays exact
+            sp["steps"] = steps
+            sp["result"] = rotate_cells(sp["cells"], sp["axis"], steps)
+            _state.update(float=list(sp["result"]), spin=(sp["axis"], steps))
+
+    def _spin_end(self, context, obj, ok):
+        sp, self.spin = self.spin, None
+        _state.update(float=None, spin=None)
+        if ok and sp["steps"] % 8:
+            new = {c: 0 for c in sp["cells"]}
+            new.update(sp["result"])
+            self._commit(context, obj, {c: [self.cells.get(c, 0), k] for c, k in new.items()
+                                        if self.cells.get(c, 0) != k})
+            _sel.clear()
+            _sel.update(sp["result"])
+        context.workspace.status_text_set(STATUS)
+        tag_redraw_all(context)
+
+    def _spin_modal(self, context, event, obj):
+        t = event.type
+        if t == 'MOUSEMOVE':
+            region = region_under_mouse(context.area, event)
+            if region is not None:
+                self._spin_update(region, event, obj)
+                context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+        if t == 'LEFTMOUSE' and event.value == 'RELEASE':
+            self._spin_end(context, obj, True)
+        elif event.value == 'PRESS' and t in {'RIGHTMOUSE', 'ESC'}:
+            self._spin_end(context, obj, False)
+        elif t == 'MIDDLEMOUSE' or t.startswith(('WHEEL', 'NUMPAD', 'TRACKPAD', 'NDOF')):
+            return {'PASS_THROUGH'}  # navigation keeps working
+        return {'RUNNING_MODAL'}
+
     # -- keyboard
     def _key(self, context, region, event, obj, vs):
         """Keyboard shortcuts (PRESS). Returns True when handled."""
@@ -1521,9 +1704,9 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         obj = context.scene.voxel_settings.target
         if _state["pick"]:
             pick_end(context)
-        if self.grab is not None:
-            self.grab = None
-            _state["float"] = None
+        if self.grab is not None or self.spin is not None:
+            self.grab = self.spin = None
+            _state.update(float=None, spin=None)
         if self.stroke and obj is not None:
             self._end_stroke(context, obj)
         _drawing = False
@@ -1554,6 +1737,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
                 pick_end(context)
             if self.grab is not None:
                 self._grab_end(context, obj, False)
+            if self.spin is not None:
+                self._spin_end(context, obj, False)
             if self.stroke:
                 self._end_stroke(context, obj)
             self.sel_press = None
@@ -1564,6 +1749,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
 
         if self.grab is not None:
             return self._grab_modal(context, event, obj)
+        if self.spin is not None:
+            return self._spin_modal(context, event, obj)
         if _state["pick"]:
             return self._pick_modal(context, event, obj, vs)
 
@@ -2027,12 +2214,15 @@ class VOXELDRAW_PT_selection(_Panel, bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("voxeldraw.selection", text="All").action = 'ALL'
         row.operator("voxeldraw.selection", text="None").action = 'NONE'
+        vs = context.scene.voxel_settings
         for action, label in (("MIRROR", "Mirror"), ("ROTATE", "Rotate"), ("FLIP", "Flip")):
             row = layout.row(align=True)
             row.label(text=label)
             for axis, name in enumerate("XYZ"):
                 op = row.operator("voxeldraw.selection", text=name)
                 op.action, op.axis = action, axis
+            if action == 'ROTATE':
+                layout.prop(vs, "rotate_gizmo", text="Rotate Gizmo (45° steps)")
         row = layout.row(align=True)
         row.operator("voxeldraw.selection", text="Delete", icon='TRASH').action = 'DELETE'
         row.operator("voxeldraw.selection", text="Paint", icon='BRUSH_DATA').action = 'PAINT'
@@ -2262,6 +2452,34 @@ def _draw_gizmo(region, rv3d, obj, vs):
           (c2.x - h, c2.y - h), (c2.x + h, c2.y + h), (c2.x - h, c2.y + h)], c)
 
 
+def _draw_rot_gizmo(region, rv3d, obj):
+    """Rotate gizmo: one ring per axis around the selection centre, region pixels."""
+    giz = rot_gizmo_screen(region, rv3d, obj, _sel, _state["size"])
+    if giz is None:
+        return
+    c2, rings = giz
+    s = bpy.context.preferences.system.ui_scale
+    spin = _state["spin"]
+    hot = spin[0] if spin else _state["ring_hover"]
+    shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    shader.bind()
+    shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+    for a, pts in rings.items():
+        col = AXIS_COLORS[a][:3]
+        if a == hot:
+            col = tuple(min(1.0, v + 0.35) for v in col)
+        alpha = 0.3 if spin and a != hot else 1.0
+        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": [(p.x, p.y, 0) for p in pts]})
+        shader.uniform_float("lineWidth", (4.0 if a == hot else 2.5) * s)
+        shader.uniform_float("color", (*col, alpha))
+        batch.draw(shader)
+    if spin:
+        blf.size(0, 14 * s)
+        blf.color(0, 1, 1, 1, 1)
+        blf.position(0, c2.x + 14 * s, c2.y + 14 * s, 0)
+        blf.draw(0, f"{spin[1] * 45:+d}°")
+
+
 def draw_overlay():
     if not _drawing:
         return
@@ -2285,6 +2503,10 @@ def draw_overlay():
     if vs.mode == 'MOVE':
         gpu.state.blend_set('ALPHA')
         _draw_gizmo(context.region, context.region_data, obj, vs)
+        gpu.state.blend_set('NONE')
+    if vs.rotate_gizmo and _sel:
+        gpu.state.blend_set('ALPHA')
+        _draw_rot_gizmo(context.region, context.region_data, obj)
         gpu.state.blend_set('NONE')
     if not vs.show_legend:
         return
