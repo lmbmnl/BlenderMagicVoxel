@@ -20,4 +20,4 @@ copyright = ["2026 lmbmnl", "2020 Sreeraj R"]
 files = "Import/export MagicaVoxel .vox files and load palette images"
 
 [build]
-paths_exclude_pattern = ["__pycache__/", "/.git/", "/*.zip", "test_*.py", "README.md", ".gitignore"]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip", "/dist/", "test_*.py", "README.md", ".gitignore"]
