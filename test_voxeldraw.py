@@ -180,6 +180,29 @@ assert abs(vd.ray_axis_param((5, 3, 10), (0, 0, -1), (0, 0, 0), 0) - 5) < 1e-9
 assert vd.ray_axis_param((5, 3, 10), (1, 0, 0), (0, 0, 0), 0) is None  # parallel
 assert vd.seg_dist((5, 3), (0, 0), (10, 0)) == 3 and vd.seg_dist((-4, 3), (0, 0), (10, 0)) == 5
 
+# --- erase stroke: the voxel behind a just-erased one is not picked (no digging)
+F = type("F", (), {k: v for k, v in vd.VOXELDRAW_OT_start.__dict__.items() if callable(v)})
+
+
+class BS:
+    brush, shape, brush_size, rotation, fill, axis, z = 'SHAPE', 'POINT', 1, 0, False, 'XY', 0.0
+    mirror_live, mirror, use_limit, model_size, tentacle = False, (True, False, False), False, (40, 40, 40), False
+
+
+wall = {(x, 0, z): 1 for x in range(3) for z in range(3)} | {(x, 1, z): 1 for x in range(3) for z in range(3)}
+op = F()
+op.cells, op.size, op.face_key, op.drag, op.stroke = dict(wall), 1.0, None, None, True
+op.snapshot, op.snap_bounds = set(wall), vd.bounds_of(wall)
+del op.cells[(1, 0, 1)]  # erased by the click
+op.bounds = vd.bounds_of(op.cells)
+ray = ((1.5, -10.0, 1.5), (0.0, 1.0, 0.0))  # same spot, mouse jittered
+assert op._brush_cells(BS, 'ERASE', *ray) == [(1, 0, 1)]  # already gone: nothing more to erase
+assert op._brush_cells(BS, 'ERASE', (0.5, -10.0, 1.5), (0.0, 1.0, 0.0)) == [(0, 0, 1)]  # next block
+BS.tentacle = True  # Extrude Mode keeps the old digging behaviour
+assert op._brush_cells(BS, 'ERASE', *ray) == [(1, 1, 1)]
+op.stroke = BS.tentacle = False
+assert op._brush_cells(BS, 'ERASE', *ray) == [(1, 1, 1)]  # hover after the stroke: the one behind
+
 # --- palette removal shifts the indices above it
 assert vd.remap_removed_color({(0, 0, 0): 3, (1, 0, 0): 7, (2, 0, 0): 5}, 5) == \
     {(0, 0, 0): 3, (1, 0, 0): 6, (2, 0, 0): 5}

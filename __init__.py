@@ -1095,8 +1095,9 @@ class VoxelSettings(bpy.types.PropertyGroup):
     show_legend: bpy.props.BoolProperty(name="Show Legend", default=True, update=_redraw)
     tentacle: bpy.props.BoolProperty(
         name="Extrude Mode", default=False,
-        description="Pick against voxels added during the same stroke "
-                    "(original 'tentacle' behaviour)")
+        description="Pick against the voxels changed during the same stroke: Attach "
+                    "grows on what it just added (original 'tentacle' behaviour), "
+                    "Erase digs through to the voxels behind")
     mode: bpy.props.EnumProperty(name="Mode", items=MODE_ITEMS, default='ATTACH', update=_redraw)
     brush: bpy.props.EnumProperty(name="Brush", items=BRUSH_ITEMS, default='SHAPE', update=_redraw,
                                   description="Brush type (B cycles)")
@@ -1287,7 +1288,9 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
                 return _state["hover"]
             return line_cells(start, end) if brush == 'LINE' else box_cells(start, end, axis, vs.fill)
         else:
-            snap = self.stroke and mode == 'ATTACH' and not vs.tentacle
+            # During a stroke pick against the voxels as they were at the click: Attach
+            # doesn't climb on what it just added, Erase doesn't dig into what was behind
+            snap = self.stroke and mode in ('ATTACH', 'ERASE') and not vs.tentacle
             pool, bnds = (self.snapshot, self.snap_bounds) if snap else (self.cells, self.bounds)
             hit = pick_cell(o, d, pool, bnds, self.size, AXIS_INDEX[vs.axis], vs.z, mode != 'ATTACH')
             if hit is None:

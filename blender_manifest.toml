@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "voxel_draw"
-version = "2.6.0"
+version = "2.6.1"
 name = "VoxelDraw"
 tagline = "MagicaVoxel-style voxel drawing with palette and brushes"
 maintainer = "Marclo"
