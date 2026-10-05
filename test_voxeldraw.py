@@ -509,6 +509,37 @@ assert op.cells == vd.load_cells(b) and op.editing  # synced and drawing on b
 assert not vd.request_session(ctx, "nope")  # not a session: nothing happens
 assert vd._state["switch"] is None
 
+# Blender's navigation gizmo (top right) gets its clicks while the tool runs
+win = types.SimpleNamespace(type='WINDOW', x=0, y=0, width=1000, height=800, data=None)
+area.regions = [win]
+area.spaces = types.SimpleNamespace(active=types.SimpleNamespace(show_gizmo=True, show_gizmo_navigate=True))
+pressed = []
+op._press = lambda *a: pressed.append(a)
+
+
+def click_at(x, y):
+    ev = types.SimpleNamespace(type='LEFTMOUSE', value='PRESS', mouse_x=x, mouse_y=y,
+                               shift=False, ctrl=False, alt=False, oskey=False)
+    return vd.VOXELDRAW_OT_start._modal(op, Ctx(), ev)
+
+
+assert click_at(950, 750) == {'PASS_THROUGH'} and not pressed  # the orbit ball
+assert click_at(978, 665) == {'PASS_THROUGH'} and not pressed  # the pan button
+assert click_at(500, 400) == {'RUNNING_MODAL'} and len(pressed) == 1  # elsewhere: draw
+del op._press
+
+# Pause / Resume (sidebar): Object Mode and back; with the tool stopped it starts it
+pr = vd.VOXELDRAW_OT_pause_resume
+assert b.mode == 'EDIT'
+assert pr.execute(None, ctx) == {'FINISHED'} and b.mode == 'OBJECT'
+assert pr.execute(None, ctx) == {'FINISHED'} and b.mode == 'EDIT'
+vd._drawing = False
+began = []
+vd._start_tool = lambda: began.append(vs.target.name)
+assert pr.execute(None, ctx) == {'FINISHED'} and began == [b.name]
+del vd._start_tool
+vd._drawing = True
+
 # delete: a paused session yes, the one in use no
 try:
     bpy.ops.voxeldraw.session_delete(name=b.name)

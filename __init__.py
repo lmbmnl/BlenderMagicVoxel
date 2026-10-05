@@ -1348,7 +1348,8 @@ class VoxelColor(bpy.types.PropertyGroup):
 class VoxelSettings(bpy.types.PropertyGroup):
     voxel_size: bpy.props.FloatProperty(
         name="Voxel Size", default=1.0, min=0.001, precision=3, subtype='DISTANCE',
-        description="Locked while the session contains voxels", update=_redraw)
+        description="Size of the voxels of a new session (or of an empty one): "
+                    "a session with voxels keeps its own size", update=_redraw)
     axis: bpy.props.EnumProperty(
         name="Floor", items=AXIS_ITEMS, default='XY', update=_redraw)
     z: bpy.props.FloatProperty(
@@ -2257,6 +2258,14 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
                 _state["hover"] = None
                 context.area.tag_redraw()
             return {'PASS_THROUGH'}
+        if (event.type in {'LEFTMOUSE', 'MOUSEMOVE'} and not (self.stroke or self.sel_press)
+                and nav_gizmo_hit(context, context.area, region,
+                                  event.mouse_x - region.x, event.mouse_y - region.y)):
+            # Blender's navigation gizmo (orbit, zoom, pan, camera, perspective) works as usual
+            if _state["hover"] is not None:
+                _state["hover"] = None
+                context.area.tag_redraw()
+            return {'PASS_THROUGH'}
 
         if (event.value == 'PRESS' and not event.type.endswith('MOUSE')
                 and self._key(context, region, event, obj, vs)):
@@ -2603,6 +2612,30 @@ class VOXELDRAW_OT_confirm(_SessionOp, bpy.types.Operator):
         return {'FINISHED'}
 
 
+class VOXELDRAW_OT_pause_resume(bpy.types.Operator):
+    bl_idname = "voxeldraw.pause_resume"
+    bl_label = "Pause / Resume"
+    bl_description = ("Pause the session (Object Mode, the viewport works as usual) or go back to "
+                      "drawing on it (same as Tab)")
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.scene.voxel_settings.target
+        return (obj is not None and obj.name in context.scene.objects
+                and context.area is not None and context.area.type == 'VIEW_3D')
+
+    def execute(self, context):
+        obj = context.scene.voxel_settings.target
+        if not _drawing:  # the tool was stopped (Esc / Exit): start it on this session
+            _start_tool()
+            return {'FINISHED'}
+        if context.view_layer.objects.active != obj:
+            activate_object(context, obj)
+        bpy.ops.object.mode_set(mode='OBJECT' if obj.mode == 'EDIT' else 'EDIT')
+        tag_redraw_all(context)
+        return {'FINISHED'}
+
+
 class VOXELDRAW_OT_session_new(bpy.types.Operator):
     bl_idname = "voxeldraw.session_new"
     bl_label = "New Session"
@@ -2698,6 +2731,9 @@ class _Panel:
 
 
 class VOXELDRAW_PT_panel(_Panel, bpy.types.Panel):
+    """While drawing everything is in the viewport panels: the sidebar keeps the
+    session commands (New, Pause / Resume, Clear, Confirm) and the voxel size of
+    the next session."""
     bl_label = "VoxelDraw"
     bl_idname = "VOXELDRAW_PT_panel"
 
@@ -2705,172 +2741,41 @@ class VOXELDRAW_PT_panel(_Panel, bpy.types.Panel):
         layout = self.layout
         vs = context.scene.voxel_settings
         obj = vs.target
-        has_cells = obj is not None and "_vd_cells" in obj
+        open_session = obj is not None and obj.name in context.scene.objects
 
         col = layout.column(align=True)
         row = col.row(align=True)
         row.scale_y = 1.4
-        row.enabled = not _drawing
-        row.operator("voxeldraw.start", text="Start Voxel", icon='PLAY')
-        col.operator("voxeldraw.clear", text="Clear", icon='TRASH')
-        col.operator("voxeldraw.confirm", text="Confirm", icon='CHECKMARK')
-        col.prop(vs, "greedy")
-        if obj is not None:
-            if _drawing and obj.mode == 'EDIT':
-                layout.label(text="Drawing  (Tab = pause)", icon='INFO')
-            elif _drawing:
-                layout.label(text="Paused  (Edit Mode = resume)", icon='INFO')
-            else:
-                layout.label(text="Session open: Start Voxel to resume", icon='INFO')
+        row.operator("voxeldraw.session_new", text="New Session", icon='ADD')
+        if open_session:
+            drawing = _drawing and obj.mode == 'EDIT'
+            row = col.row(align=True)
+            row.scale_y = 1.4
+            row.operator("voxeldraw.pause_resume", text="Pause" if drawing else "Resume",
+                         icon='PAUSE' if drawing else 'PLAY')
+            row = col.row(align=True)
+            row.operator("voxeldraw.clear", text="Clear", icon='TRASH')
+            row.operator("voxeldraw.confirm", text="Confirm", icon='CHECKMARK')
+            layout.label(text=obj.name + ("  (drawing)" if drawing else "  (paused)"), icon='MESH_CUBE')
+        sub = layout.column()
+        sub.prop(vs, "voxel_size", text="Voxel Size (new session)")
 
-        col = layout.column(align=True)
-        sub = col.column()
-        sub.enabled = not has_cells
-        sub.prop(vs, "voxel_size")
-        col.prop(vs, "axis")
-        col.prop(vs, "z")
-        col.prop(vs, "show_floor")
-        col.prop(vs, "show_bounds")
-        col.prop(vs, "show_legend")
-        col.prop(vs, "tentacle")
+
+class VOXELDRAW_PT_more(_Panel, bpy.types.Panel):
+    """What the viewport panels cannot do: rename palette colours, reset the panels."""
+    bl_label = "Palette Names & Panels"
+    bl_parent_id = "VOXELDRAW_PT_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        vs = context.scene.voxel_settings
+        if len(vs.palette) >= 2:
+            layout.template_list("VOXELDRAW_UL_palette", "", vs, "palette", vs, "color_index", rows=6)
+            layout.operator("voxeldraw.palette_add", icon='ADD')
         row = layout.row(align=True)
         row.prop(vs, "viewport_ui")
         row.operator("voxeldraw.reset_ui", text="", icon='LOOP_BACK')
-
-
-class VOXELDRAW_PT_sessions(_Panel, bpy.types.Panel):
-    bl_label = "Sessions"
-    bl_parent_id = "VOXELDRAW_PT_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        vs = context.scene.voxel_settings
-        layout.operator("voxeldraw.session_new", icon='ADD')
-        sessions = open_sessions(context.scene)
-        if not sessions:
-            layout.label(text="No open sessions", icon='INFO')
-            return
-        col = layout.column(align=True)
-        for o in sessions:
-            current = o == vs.target
-            if current and _drawing and o.mode == 'EDIT':
-                icon = 'EDITMODE_HLT'  # drawing on it now
-            elif current:
-                icon = 'PAUSE'
-            else:
-                icon = 'PLAY'
-            row = col.row(align=True)
-            row.operator("voxeldraw.session_resume", text="", icon=icon, depress=current).name = o.name
-            row.prop(o, "name", text="")
-            count = row.row()
-            count.ui_units_x = 2.5
-            count.label(text=str(len(o["_vd_cols"])) if "_vd_cols" in o else "0")
-            row.operator("voxeldraw.session_delete", text="", icon='X').name = o.name
-
-
-class VOXELDRAW_PT_brush(_Panel, bpy.types.Panel):
-    bl_label = "Brush"
-    bl_parent_id = "VOXELDRAW_PT_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        vs = context.scene.voxel_settings
-        layout.row().prop(vs, "mode", expand=True)
-        if vs.mode == 'MOVE':
-            layout.row().prop(vs, "move_axis", expand=True)
-            if not _sel:
-                layout.label(text="Select voxels first (Select mode)", icon='INFO')
-        layout.row().prop(vs, "brush", expand=True)
-        col = layout.column(align=True)
-        col.enabled = vs.brush == 'SHAPE'
-        col.prop(vs, "shape")
-        col.prop(vs, "brush_size")
-        col.prop(vs, "rotation")
-        layout.prop(vs, "fill")
-        row = layout.row(align=True)
-        row.prop(vs, "mirror_live", text="Live Mirror", toggle=True, icon='MOD_MIRROR')
-        axes = row.row(align=True)
-        axes.active = vs.mirror_live
-        axes.prop(vs, "mirror", text="", toggle=True)
-        layout.prop(vs, "use_limit")
-        col = layout.column(align=True)
-        col.enabled = vs.use_limit
-        col.prop(vs, "model_size", text="")
-
-
-class VOXELDRAW_PT_selection(_Panel, bpy.types.Panel):
-    bl_label = "Selection"
-    bl_parent_id = "VOXELDRAW_PT_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text=f"{len(_sel)} selected    clipboard: {len(_clip)}")
-        row = layout.row(align=True)
-        row.operator("voxeldraw.selection", text="All").action = 'ALL'
-        row.operator("voxeldraw.selection", text="None").action = 'NONE'
-        vs = context.scene.voxel_settings
-        for action, label in (("MIRROR", "Mirror"), ("ROTATE", "Rotate"), ("FLIP", "Flip")):
-            row = layout.row(align=True)
-            row.label(text=label)
-            for axis, name in enumerate("XYZ"):
-                op = row.operator("voxeldraw.selection", text=name)
-                op.action, op.axis = action, axis
-            if action == 'ROTATE':
-                layout.prop(vs, "rotate_gizmo", text="Rotate Gizmo (45° steps)")
-        row = layout.row(align=True)
-        row.operator("voxeldraw.selection", text="Delete", icon='TRASH').action = 'DELETE'
-        row.operator("voxeldraw.selection", text="Paint", icon='BRUSH_DATA').action = 'PAINT'
-        row.operator("voxeldraw.selection", text="Copy", icon='COPYDOWN').action = 'COPY'
-        ts = context.tool_settings  # the same settings as the Edit Mode header (O)
-        row = layout.row(align=True)
-        icon = ('PROP_OFF' if not ts.use_proportional_edit else 'PROP_CON' if ts.use_proportional_connected
-                else 'PROP_PROJECTED' if ts.use_proportional_projected else 'PROP_ON')
-        row.prop(ts, "use_proportional_edit", icon_only=True, icon=icon)
-        sub = row.row(align=True)
-        sub.active = ts.use_proportional_edit
-        sub.prop_with_popover(ts, "proportional_edit_falloff", text="", icon_only=True,
-                              panel="VIEW3D_PT_proportional_edit")
-        sub.prop(ts, "proportional_distance" if hasattr(ts, "proportional_distance") else "proportional_size",
-                 text="Size")
-        sub.prop(context.scene.voxel_settings, "prop_stretch", toggle=True)
-
-
-class VOXELDRAW_PT_palette(_Panel, bpy.types.Panel):
-    bl_label = "Palette"
-    bl_parent_id = "VOXELDRAW_PT_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        vs = context.scene.voxel_settings
-        if len(vs.palette) < 2:
-            layout.label(text="Created by Start Voxel", icon='COLOR')
-            layout.operator("voxeldraw.load_palette", icon='FILEBROWSER')
-            return
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator("voxeldraw.eyedropper", text="", icon='EYEDROPPER')
-        if vs.color_index < len(vs.palette):
-            item = vs.palette[vs.color_index]
-            row.label(text=f"{vs.color_index}  {item.name}")
-            row.prop(item, "color", text="")
-        row.operator("voxeldraw.palette_add", text="", icon='ADD')
-        layout.template_list("VOXELDRAW_UL_palette", "", vs, "palette", vs, "color_index", rows=8)
-        row = layout.row(align=True)
-        row.prop(vs, "replace_from")
-        row.operator("voxeldraw.replace_color", text="→ active")
-        row = layout.row(align=True)
-        row.operator("voxeldraw.load_palette", text="Load", icon='FILEBROWSER')
-        row.operator("voxeldraw.reset_palette", text="Default", icon='LOOP_BACK')
-
-
-class VOXELDRAW_PT_file(_Panel, bpy.types.Panel):
-    bl_label = "MagicaVoxel"
-    bl_parent_id = "VOXELDRAW_PT_panel"
-
-    def draw(self, context):
-        row = self.layout.row(align=True)
-        row.operator("voxeldraw.import_vox", icon='IMPORT')
-        row.operator("voxeldraw.export_vox", icon='EXPORT')
 
 
 # ---------------------------------------------------------------- viewport preview
@@ -3402,7 +3307,7 @@ def build_viewport_ui():
                         name=lambda i: _vs().palette[i].name,
                         tooltip="Click: active colour. Wheel: scroll"),
         *[S(label, *_hsv(k), 0.0, 1.0, step=0.01, digits=2, enabled=lambda: _active_rgb() is not None,
-            tooltip="Edit the active colour (rename it in the sidebar)")
+            tooltip="Edit the active colour (rename it in the sidebar: Palette Names & Panels)")
           for k, label in enumerate(("Hue", "Saturation", "Value"))],
         Row(prop_slider("replace_from", "From", 1, 255, tooltip="Palette index to replace", flex=True),
             op_button("To Active", ICONS['replace'], lambda env: bpy.ops.voxeldraw.replace_color(),
@@ -3443,8 +3348,10 @@ def build_viewport_ui():
 
     # -- bottom left: scene and files
     scene = vd_ui.Panel("scene", "Scene", Col(
-        prop_slider("voxel_size", "Voxel Size", 0.001, 100.0, digits=3, log=True, min_w=170, step=0.05,
-                    enabled=lambda: not _has_cells(), tooltip="Locked while the session contains voxels"),
+        S("Voxel Size",  # the session's own size once it has voxels (the setting is for new ones)
+          lambda: session_size(_vs().target, _vs()) if _has_cells() else _vs().voxel_size,
+          lambda v: setattr(_vs(), "voxel_size", v), 0.001, 100.0, digits=3, log=True, min_w=170, step=0.05,
+          enabled=lambda: not _has_cells(), tooltip="Locked while the session contains voxels"),
         Row(L("Floor", small=True), *[radio("axis", a, label, tip=tip) for a, label, tip in AXIS_ITEMS],
             equal=True),
         prop_slider("z", "Floor Offset", -100.0, 100.0, digits=2, step=0.5,
@@ -3580,6 +3487,37 @@ def ui_bounds(area, region):
     return L, B, R, T
 
 
+def nav_gizmo_hit(context, area, region, mx, my):
+    """True if region pixel (mx, my) is on Blender's navigation gizmo: the orbit
+    ball or the zoom / pan / camera / perspective buttons under it. Same layout as
+    Blender 5.0 (view3d_gizmo_navigate.cc, WIDGETGROUP_navigate_draw_prepare)."""
+    space = area.spaces.active
+    if not (space.show_gizmo and space.show_gizmo_navigate):
+        return False
+    view, system = context.preferences.view, context.preferences.system
+    ball = view.mini_axis_type == 'GIZMO'
+    if not (ball or view.show_navigate_ui):
+        return False
+    s = system.ui_scale or 1.0
+    _l, _b, right, top = ui_bounds(area, region)  # ED_region_visible_rect
+    size = view.gizmo_size_navigate_v3d
+    offset = (size / 2 + 10) * s  # GIZMO_SIZE / 2 + GIZMO_OFFSET
+    if ball and (mx - (right - offset)) ** 2 + (my - (top - offset)) ** 2 <= (size / 2 * s) ** 2:
+        return True
+    if not view.show_navigate_ui:
+        return False
+    mini = (28 + 2) * s  # GIZMO_MINI_SIZE + GIZMO_MINI_OFFSET
+    if ball:
+        below = offset * 2.1
+    elif view.mini_axis_type == 'MINIMAL':
+        below = 20 * s * 2.5 + view.mini_axis_size * system.pixel_size * 2
+    else:
+        below = mini * 0.75
+    x, y = round(right - mini * 0.75), round(top - below)
+    # zoom, pan, camera, perspective (or camera lock): up to 4 buttons, one below the other
+    return any((mx - x) ** 2 + (my - (y - mini * slot)) ** 2 <= (14 * s) ** 2 for slot in range(4))
+
+
 def draw_viewport_ui(context, area, region):
     global _painter
     if _painter is None:
@@ -3648,17 +3586,14 @@ classes = (
     VOXELDRAW_OT_import_vox,
     VOXELDRAW_OT_export_vox,
     VOXELDRAW_OT_confirm,
+    VOXELDRAW_OT_pause_resume,
     VOXELDRAW_OT_session_new,
     VOXELDRAW_OT_session_resume,
     VOXELDRAW_OT_session_delete,
     VOXELDRAW_OT_reset_ui,
     VOXELDRAW_UL_palette,
     VOXELDRAW_PT_panel,
-    VOXELDRAW_PT_sessions,
-    VOXELDRAW_PT_brush,
-    VOXELDRAW_PT_selection,
-    VOXELDRAW_PT_palette,
-    VOXELDRAW_PT_file,
+    VOXELDRAW_PT_more,
 )
 def register():
     for cls in classes:

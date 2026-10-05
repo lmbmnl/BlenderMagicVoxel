@@ -328,6 +328,8 @@ for x in range(-4, 5):
 assert vd._state["prop"] is None and vd._state["float_del"] is None
 ts.use_proportional_edit = False
 
+import types  # noqa: E402
+
 # sessions in the Session panel: one button per open session (current lit), New
 second = vd.new_session_object(ctx)  # the current one now; obj is paused
 vd.save_cells(second, {(0, 0, 0): 3}, 1.0)
@@ -356,6 +358,21 @@ assert more.visible and U._val(more.text) == "+2 (sidebar)"
 rects = [q.rect for q in ui.panels if q.visible]
 assert not [(a, b) for i, a in enumerate(rects) for b in rects[i + 1:] if U.clip_rect(a, b)]  # still no overlap
 vs.target = obj
+
+# where Blender 5.0 draws the navigation gizmo (view3d_gizmo_navigate.cc), default preferences
+win = types.SimpleNamespace(type='WINDOW', x=0, y=0, width=1000, height=800)
+space = types.SimpleNamespace(show_gizmo=True, show_gizmo_navigate=True)
+nav_area = types.SimpleNamespace(regions=[win], spaces=types.SimpleNamespace(active=space))
+hit = lambda x, y: vd.nav_gizmo_hit(ctx, nav_area, win, x, y)  # noqa: E731
+assert hit(950, 750) and hit(950, 789) and not hit(950, 799)  # orbit ball: centre 50 px in, radius 40
+assert hit(978, 695) and hit(978, 605) and not hit(978, 575)  # 4 buttons below it, 30 px apart
+assert not hit(500, 400) and not hit(900, 695)
+space.show_gizmo_navigate = False
+assert not hit(950, 750)
+space.show_gizmo_navigate = True
+side = types.SimpleNamespace(type='UI', x=800, y=0, width=200, height=800)  # sidebar over the view
+nav_area.regions = [win, side]
+assert hit(750, 750) and not hit(950, 750)
 
 # the tool never leaves handlers / panels behind: errors, Blender cancelling it, closed area
 import types  # noqa: E402
