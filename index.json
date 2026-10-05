@@ -7,7 +7,7 @@
       "id": "voxel_draw",
       "name": "VoxelDraw",
       "tagline": "MagicaVoxel-style voxel drawing with palette and brushes",
-      "version": "2.10.0",
+      "version": "2.11.0",
       "type": "add-on",
       "maintainer": "Marclo",
       "license": [
@@ -27,9 +27,9 @@
         "Mesh",
         "Modeling"
       ],
-      "archive_url": "./voxel_draw-2.10.0.zip",
-      "archive_size": 53848,
-      "archive_hash": "sha256:e58c0d145d846d6b7138aae6d450d326b4e92300eb270fdd62737f715a5a3626"
+      "archive_url": "./voxel_draw-2.11.0.zip",
+      "archive_size": 56236,
+      "archive_hash": "sha256:f321b1a57e2ccf75095e35c4f7cd9f048b03ec7b412df84b3e7f17b3a5af599f"
     }
   ]
 }
