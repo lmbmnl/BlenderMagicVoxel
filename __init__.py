@@ -858,11 +858,14 @@ def plane_cell(o, d, start, axis, size):
 _drawing = False
 _state = {"area": 0, "hover": None, "size": 1.0, "mode": 'ATTACH', "float": None,
           "ring_hover": None, "spin": None, "float_del": None, "prop": None,
-          "rect": None, "bounds": None, "pick": False, "gizmo_hover": None, "line": None}
+          "rect": None, "bounds": None, "pick": False, "gizmo_hover": None, "line": None,
+          "switch": None}  # session to resume (object name, "" = a new one), for the modal
 # Own undo history: entries are ({cell: [old_colour, new_colour]}, voxel_size),
 # colour 0 = empty. "rev" is the revision of object "obj" (name) produced by our
 # own last change: while they match, the history applies (even between sessions).
 _hist = {"undo": [], "redo": [], "rev": None, "obj": None}
+_hist_stash = {}  # paused sessions' own undo history: object name -> (undo, redo, rev)
+SESSION_SLOTS = 6  # session buttons in the viewport Session panel (all of them in the sidebar)
 _sel = set()   # selected cells
 _clip = {}     # copied voxels, relative to their lowest corner
 MAX_HISTORY = 100
@@ -1203,12 +1206,88 @@ def ensure_session_object(context):
     obj = vs.target
     if obj is not None and obj.name in context.scene.objects:
         return obj
+    return new_session_object(context)
+
+
+def new_session_object(context):
+    """A new empty session object, made the current one (the others stay as they are)."""
     me = bpy.data.meshes.new("VoxelDraw")
     obj = bpy.data.objects.new("VoxelDraw", me)
     context.collection.objects.link(obj)
     obj["_vd_rev"] = 0
-    vs.target = obj
+    context.scene.voxel_settings.target = obj
+    forget_sessions()
     return obj
+
+
+def open_sessions(scene):
+    """Session objects of the scene not confirmed yet (current and paused), by name."""
+    return sorted((o for o in scene.objects if o.type == 'MESH' and "_vd_rev" in o), key=lambda o: o.name)
+
+
+_sessions_cache = [0.0, None, []]  # time, scene, sessions: the viewport panel asks often
+
+
+def cached_sessions(scene, ttl=0.25):
+    """open_sessions for the viewport panel (redrawn on every mouse move, many
+    buttons ask): recomputed at most every `ttl` seconds."""
+    now = time.perf_counter()
+    if _sessions_cache[1] is not scene or now - _sessions_cache[0] > ttl:
+        _sessions_cache[:] = [now, scene, open_sessions(scene)]
+    return [o for o in _sessions_cache[2] if _alive(o, scene)]
+
+
+def _alive(obj, scene):
+    try:
+        return obj.name in scene.objects
+    except ReferenceError:  # deleted (Blender undo, X in the outliner)
+        return False
+
+
+def forget_sessions():
+    """Sessions were added / removed: the viewport panel reads them again now."""
+    _sessions_cache[0] = 0.0
+
+
+def stash_history():
+    """Keep the current session's undo history aside while another session runs."""
+    if _hist["obj"]:
+        _hist_stash[_hist["obj"]] = (_hist["undo"], _hist["redo"], _hist["rev"])
+
+
+def restore_history(obj):
+    """The undo history obj had when it was paused (if its voxels did not change since)."""
+    undo, redo, rev = _hist_stash.pop(obj.name, ([], [], None))
+    _hist.update(undo=undo, redo=redo, rev=rev, obj=obj.name)
+    if not history_valid(obj):
+        _hist.update(undo=[], redo=[], rev=int(obj.get("_vd_rev", 0)), obj=obj.name)
+
+
+def request_session(context, name):
+    """Resume session `name` ("" = start a new one). While the tool runs its modal
+    does the switch (it owns strokes, history and Edit Mode); otherwise Start Voxel
+    is called on it. Returns False if `name` is not an open session."""
+    vs = context.scene.voxel_settings
+    obj = context.scene.objects.get(name) if name else None
+    if name and (obj is None or "_vd_rev" not in obj):
+        return False
+    if _drawing:
+        _state["switch"] = name
+        tag_redraw_all(context)
+        return True
+    if obj is not vs.target:
+        stash_history()
+        if obj is None:
+            new_session_object(context)  # Start places its first voxel
+        else:
+            vs.target = obj
+            restore_history(obj)
+    _start_tool()
+    return True
+
+
+def _start_tool():
+    bpy.ops.voxeldraw.start('INVOKE_DEFAULT')
 
 
 def place_first_voxel(context, obj, vs):
@@ -2000,6 +2079,48 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         self._timer = None
         return {'FINISHED'}
 
+    def _switch(self, context, old, request):
+        """Pause `old` and draw on session `request` (object name, "" = a new
+        session at the 3D cursor). The paused session keeps its voxels and its own
+        undo history; picking it again resumes it."""
+        vs = context.scene.voxel_settings
+        new = context.scene.objects.get(request) if request else None
+        if request and (new is None or "_vd_rev" not in new):
+            return  # deleted / confirmed in the meantime
+        # end what the mouse was doing, as Tab does
+        if _state["pick"]:
+            pick_end(context)
+        if self.grab is not None:
+            self._grab_end(context, old, False)
+        if self.spin is not None:
+            self._spin_end(context, old, False)
+        if self.stroke:
+            self._end_stroke(context, old)
+        self.sel_press = None
+        _state["rect"] = None
+        if new is old:  # the current session: just resume it
+            if old.mode != 'EDIT':
+                activate_object(context, old)
+                bpy.ops.object.mode_set(mode='EDIT')
+            return
+        if old.mode != 'OBJECT' and context.view_layer.objects.active == old:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        stash_history()
+        if new is None:
+            new = new_session_object(context)
+            place_first_voxel(context, new, vs)
+        vs.target = new
+        restore_history(new)
+        ensure_material(new)
+        activate_object(context, new)
+        bpy.ops.object.mode_set(mode='EDIT')
+        _sel.clear()
+        self.cells, self.bounds, self.rev = {}, None, -1  # loaded from `new` below
+        self.snapshot, self.snap_bounds = set(), None
+        self.drag = self.face_key = self.face_cells = None
+        self.editing = None  # forces the Edit Mode transition: sync + rebuild
+        tag_redraw_all(context)
+
     def _exit(self, context):
         """Esc / Exit: stop the tool and leave Edit Mode; Start Voxel resumes."""
         obj = context.scene.voxel_settings.target
@@ -2059,6 +2180,11 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         if area is None or area.as_pointer() != _state["area"]:
             # Our viewport is in another workspace (wait for it) or was closed (stop)
             return {'PASS_THROUGH'} if area_exists(_state["area"]) else self._finish(context)
+
+        if _state["switch"] is not None:  # New Session / another session picked
+            request, _state["switch"] = _state["switch"], None
+            self._switch(context, obj, request)
+            obj = vs.target
 
         editing = obj.mode == 'EDIT'
         if editing != self.editing:  # Tab between Edit / Object = resume / pause
@@ -2447,6 +2573,8 @@ class VOXELDRAW_OT_confirm(_SessionOp, bpy.types.Operator):
             return {'CANCELLED'}  # before touching anything: the session goes on
         _drawing = False  # the modal operator notices and stops
         _hist.update(undo=[], redo=[], rev=None, obj=None)
+        _hist_stash.pop(obj.name, None)
+        forget_sessions()
         _sel.clear()
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -2472,6 +2600,73 @@ class VOXELDRAW_OT_confirm(_SessionOp, bpy.types.Operator):
         vs.target = None
         tag_redraw_all(context)
         self.report({'INFO'}, f"Voxel mesh confirmed ({len(me.polygons)} faces)")
+        return {'FINISHED'}
+
+
+class VOXELDRAW_OT_session_new(bpy.types.Operator):
+    bl_idname = "voxeldraw.session_new"
+    bl_label = "New Session"
+    bl_description = ("Pause the current session and start a new one at the 3D cursor. "
+                      "The paused sessions stay in the Sessions list: click one to resume it")
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == 'VIEW_3D'
+
+    def execute(self, context):
+        request_session(context, "")
+        return {'FINISHED'}
+
+
+class VOXELDRAW_OT_session_resume(bpy.types.Operator):
+    bl_idname = "voxeldraw.session_resume"
+    bl_label = "Resume Session"
+    bl_description = "Pause the current session and draw on this one (its undo history comes back too)"
+
+    name: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == 'VIEW_3D'
+
+    def execute(self, context):
+        if not request_session(context, self.name):
+            self.report({'ERROR'}, f"'{self.name}' is not an open voxel session")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class VOXELDRAW_OT_session_delete(bpy.types.Operator):
+    bl_idname = "voxeldraw.session_delete"
+    bl_label = "Delete Session"
+    bl_description = "Delete this paused session and its voxels"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        vs = context.scene.voxel_settings
+        obj = context.scene.objects.get(self.name)
+        if obj is None or "_vd_rev" not in obj:
+            self.report({'ERROR'}, f"'{self.name}' is not an open voxel session")
+            return {'CANCELLED'}
+        if obj is vs.target and _drawing:
+            self.report({'ERROR'}, "This is the session in use: switch to another one or Exit first")
+            return {'CANCELLED'}
+        _hist_stash.pop(obj.name, None)
+        if _hist["obj"] == obj.name:
+            _hist.update(undo=[], redo=[], rev=None, obj=None)
+        if vs.target is obj:
+            vs.target = None
+        me = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        forget_sessions()
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+        tag_redraw_all(context)
         return {'FINISHED'}
 
 
@@ -2541,6 +2736,36 @@ class VOXELDRAW_PT_panel(_Panel, bpy.types.Panel):
         row = layout.row(align=True)
         row.prop(vs, "viewport_ui")
         row.operator("voxeldraw.reset_ui", text="", icon='LOOP_BACK')
+
+
+class VOXELDRAW_PT_sessions(_Panel, bpy.types.Panel):
+    bl_label = "Sessions"
+    bl_parent_id = "VOXELDRAW_PT_panel"
+
+    def draw(self, context):
+        layout = self.layout
+        vs = context.scene.voxel_settings
+        layout.operator("voxeldraw.session_new", icon='ADD')
+        sessions = open_sessions(context.scene)
+        if not sessions:
+            layout.label(text="No open sessions", icon='INFO')
+            return
+        col = layout.column(align=True)
+        for o in sessions:
+            current = o == vs.target
+            if current and _drawing and o.mode == 'EDIT':
+                icon = 'EDITMODE_HLT'  # drawing on it now
+            elif current:
+                icon = 'PAUSE'
+            else:
+                icon = 'PLAY'
+            row = col.row(align=True)
+            row.operator("voxeldraw.session_resume", text="", icon=icon, depress=current).name = o.name
+            row.prop(o, "name", text="")
+            count = row.row()
+            count.ui_units_x = 2.5
+            count.label(text=str(len(o["_vd_cols"])) if "_vd_cols" in o else "0")
+            row.operator("voxeldraw.session_delete", text="", icon='X').name = o.name
 
 
 class VOXELDRAW_PT_brush(_Panel, bpy.types.Panel):
@@ -3076,6 +3301,20 @@ def build_viewport_ui():
     def op_button(text, icon, call, tip="", **kw):
         return B(text, icon=icon, tooltip=tip, on_click=lambda env: _run(env, lambda: call(env)), **kw)
 
+    def session_slot(i):
+        """Button i of the open sessions: the current one lit, click = resume."""
+        def obj():
+            sessions = cached_sessions(bpy.context.scene)
+            return sessions[i] if i < len(sessions) else None
+
+        def resume(env):
+            o = obj()
+            if o is not None:
+                request_session(env.context, o.name)
+        return B(lambda: obj().name if obj() else "", active=lambda: obj() is not None and obj() == _vs().target,
+                 visible=lambda: obj() is not None, on_click=resume,
+                 tooltip="Resume this session (the current one is paused, voxels and undo kept)")
+
     def sel_op(action, axis=0):
         return lambda env: bpy.ops.voxeldraw.selection(action=action, axis=axis)
 
@@ -3121,6 +3360,13 @@ def build_viewport_ui():
             toggle("greedy", "Optimize", None, "On Confirm merge same-colour coplanar faces (greedy mesh)"),
             B("Exit", icon=ICONS['exit'], tooltip="Stop the tool (Esc). The voxels stay: Start Voxel resumes",
               on_click=lambda env: setattr(env.op, "exit_requested", True))),
+        Row(L("Sessions", small=True, dim=True),
+            *[session_slot(i) for i in range(SESSION_SLOTS)],
+            L(lambda: "+%d (sidebar)" % (len(cached_sessions(bpy.context.scene)) - SESSION_SLOTS),
+              small=True, dim=True,
+              visible=lambda: len(cached_sessions(bpy.context.scene)) > SESSION_SLOTS),
+            op_button("New", ICONS['add'], lambda env: request_session(env.context, ""),
+                      "Pause this session and start a new one at the 3D cursor")),
         L(lambda: legend_lines(_vs())[0], small=True, dim=True, align="CENTER"),
     ), icon=ICONS['session'], anchor=(0.5, 0), offset=(0, 8))
 
@@ -3383,6 +3629,8 @@ def _on_load(_dummy):
     _remove_draw_handlers()
     _sel.clear()
     _hist.update(undo=[], redo=[], rev=None, obj=None)  # it belonged to the previous file
+    _hist_stash.clear()
+    _state["switch"] = None
 
 
 classes = (
@@ -3400,9 +3648,13 @@ classes = (
     VOXELDRAW_OT_import_vox,
     VOXELDRAW_OT_export_vox,
     VOXELDRAW_OT_confirm,
+    VOXELDRAW_OT_session_new,
+    VOXELDRAW_OT_session_resume,
+    VOXELDRAW_OT_session_delete,
     VOXELDRAW_OT_reset_ui,
     VOXELDRAW_UL_palette,
     VOXELDRAW_PT_panel,
+    VOXELDRAW_PT_sessions,
     VOXELDRAW_PT_brush,
     VOXELDRAW_PT_selection,
     VOXELDRAW_PT_palette,

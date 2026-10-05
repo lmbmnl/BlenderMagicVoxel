@@ -452,6 +452,91 @@ vs.greedy = True
 assert bpy.ops.voxeldraw.confirm() == {'FINISHED'}
 assert len(me.polygons) < 42 and "_vd_cells" not in obj and vs.target is None
 assert me.materials[0].name == "VoxelDraw"
+
+# --- more sessions: pause one, start another, come back to it (voxels and undo kept)
+import types  # noqa: E402
+ctx = bpy.context
+assert vd.open_sessions(scene) == []  # the confirmed one is not a session any more
+a = vd.new_session_object(ctx)
+vd.place_first_voxel(ctx, a, vs)
+vd.ensure_material(a)
+vd.activate_object(ctx, a)
+bpy.ops.object.mode_set(mode='EDIT')
+vd._hist.update(undo=[], redo=[], rev=int(a["_vd_rev"]), obj=a.name)
+cells_a = vd.load_cells(a)
+vd.commit(scene, a, cells_a, {(1, 0, 0): [0, 3]}, 1.0)
+assert len(vd._hist["undo"]) == 1 and vd.history_valid(a)
+
+F = type("F", (), {k: v for k, v in vd.VOXELDRAW_OT_start.__dict__.items() if callable(v)})
+op = F()
+op.grab = op.spin = op.sel_press = op.drag = None
+op.stroke = op.deleting = op.dirty = False
+op.editing, op.cells, op.rev, op.size = True, cells_a, int(a["_vd_rev"]), 1.0
+op.changes, op.last_build, op.face_key, op.face_cells, op.exit_requested = {}, 0.0, None, None, False
+op._timer = None
+vd._drawing = True
+scene.cursor.location = (10, 0, 0)
+op._switch(ctx, a, "")  # New Session
+b = vs.target
+assert b is not a and b.mode == 'EDIT' and a.mode == 'OBJECT'
+assert vd.load_cells(b) == {(0, 0, 0): vs.color_index}  # first voxel at the cursor
+assert vd.load_cells(a) == cells_a  # the paused one keeps its voxels...
+assert a.name in vd._hist_stash and vd._hist["obj"] == b.name and vd._hist["undo"] == []  # ...and its undo
+assert op.editing is None  # the modal syncs the new session on its next event
+vd.commit(scene, b, vd.load_cells(b), {(0, 0, 1): [0, 2]}, 1.0)
+assert [o.name for o in vd.open_sessions(scene)] == sorted([a.name, b.name])
+
+op._switch(ctx, b, a.name)  # back to the first one
+assert vs.target is a and a.mode == 'EDIT' and b.mode == 'OBJECT'
+assert len(vd._hist["undo"]) == 1 and vd.history_valid(a)  # Ctrl+Z still works on it
+assert b.name in vd._hist_stash and len(vd._hist_stash[b.name][0]) == 1
+
+# the request goes through the running modal (it owns strokes, history, Edit Mode)
+vd._state["area"] = 777
+area = types.SimpleNamespace(as_pointer=lambda: 777, tag_redraw=lambda: None)
+
+
+class Ctx:
+    def __getattr__(self, name):
+        return area if name == "area" else getattr(bpy.context, name)
+
+
+timer = types.SimpleNamespace(type='TIMER', value='NOTHING')
+assert vd.request_session(ctx, b.name) and vd._state["switch"] == b.name
+assert vd.VOXELDRAW_OT_start._modal(op, Ctx(), timer) == {'PASS_THROUGH'}
+assert vs.target is b and b.mode == 'EDIT' and vd._state["switch"] is None
+assert op.cells == vd.load_cells(b) and op.editing  # synced and drawing on b
+assert not vd.request_session(ctx, "nope")  # not a session: nothing happens
+assert vd._state["switch"] is None
+
+# delete: a paused session yes, the one in use no
+try:
+    bpy.ops.voxeldraw.session_delete(name=b.name)
+    raise AssertionError("must be refused")
+except RuntimeError as e:
+    assert "session in use" in str(e)
+a_name = a.name
+assert bpy.ops.voxeldraw.session_delete(name=a_name) == {'FINISHED'}
+assert a_name not in [o.name for o in vd.open_sessions(scene)] and not vd._hist_stash
+
+# with the tool stopped, resuming sets the target, restores its undo and starts the tool
+started = []
+vd._start_tool = lambda: started.append(vs.target.name)
+bpy.ops.object.mode_set(mode='OBJECT')
+vd._drawing = False
+c = vd.new_session_object(ctx)  # current: c; b paused with its history
+vd.place_first_voxel(ctx, c, vs)
+vd._hist_stash[b.name] = (vd._hist["undo"], vd._hist["redo"], vd._hist["rev"])
+vd._hist.update(undo=[], redo=[], rev=None, obj=None)
+assert vd.request_session(ctx, b.name) and started == [b.name] and vs.target is b
+assert vd._hist["obj"] == b.name and len(vd._hist["undo"]) == 1
+assert vd.request_session(ctx, "") and vs.target not in (b, c) and len(started) == 2
+del vd._start_tool
+
+# Confirm finishes only the current session
+vd.save_cells(vs.target, {(0, 0, 0): 1}, 1.0)
+assert bpy.ops.voxeldraw.confirm() == {'FINISHED'}
+assert sorted(o.name for o in vd.open_sessions(scene)) == sorted([b.name, c.name])
 vd.unregister()
 print("ALL TESTS PASSED")
 sys.exit(0)

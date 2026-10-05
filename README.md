@@ -19,6 +19,9 @@ MagicaVoxel-style voxel editor inside Blender 5.x: draw coloured voxels directly
 - Viewport panels (RetopoFlow style) while drawing: Tools, Brush, Session, Symmetry, Palette
   (resizable), Selection, Scene, Shortcuts. Drag a header to move a panel, ▾ to collapse it;
   places and sizes are saved in the .blend. U hides them, the sidebar panels stay available
+- More sessions at once: **New** pauses the current one and starts another at the 3D cursor;
+  click a session (Session panel in the viewport, or Sessions in the sidebar) to go back to it,
+  with its voxels and its own undo history. Each session is an object until you Confirm it
 
 ## Install
 
@@ -31,6 +34,8 @@ blender --command extension build --source-dir . --output-dir ..
 
 Then open the **VoxelDraw** tab in the 3D View sidebar (N) and press **Start Voxel**.
 Esc (or Exit in the Session panel) stops the tool; Start Voxel resumes the session.
+**New Session** (sidebar → Sessions, or New in the Session panel) pauses it and starts another;
+the Sessions list resumes ( ▶ ), renames or deletes ( X ) the paused ones.
 
 ## Tests
 

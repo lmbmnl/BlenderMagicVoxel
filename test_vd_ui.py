@@ -328,6 +328,35 @@ for x in range(-4, 5):
 assert vd._state["prop"] is None and vd._state["float_del"] is None
 ts.use_proportional_edit = False
 
+# sessions in the Session panel: one button per open session (current lit), New
+second = vd.new_session_object(ctx)  # the current one now; obj is paused
+vd.save_cells(second, {(0, 0, 0): 3}, 1.0)
+ui.layout(P, BOUNDS, 1.0)
+names = {obj.name, second.name}
+slots = [w for q in ui.panels for w in U._walk(q.body)
+         if isinstance(w, U.Button) and w.visible and U._val(w.text) in names]
+assert sorted(U._val(w.text) for w in slots) == sorted(names)
+assert [U._val(w.text) for w in slots if U._val(w.active)] == [second.name]
+vd._drawing = True  # the modal does the switch: the buttons only ask for it
+ui.env = type("Env", (), {"context": bpy.context,
+                          "op": type("Op", (), {"report": lambda self, t, m: reports.append(m)})()})()
+click(ui, next(w for w in slots if U._val(w.text) == obj.name))
+assert vd._state["switch"] == obj.name
+click(ui, find(lambda w: isinstance(w, U.Button) and "start a new one" in U._val(w.tooltip)))
+assert vd._state["switch"] == ""
+vd._state["switch"] = None
+vd._drawing = False
+vs.target = obj
+for extra in range(vd.SESSION_SLOTS):  # more than fit: the rest are in the sidebar
+    vd.new_session_object(ctx)
+vd.forget_sessions()
+ui.layout(P, BOUNDS, 1.0)
+more = find(lambda w: isinstance(w, U.Label) and "sidebar" in str(U._val(w.text)))
+assert more.visible and U._val(more.text) == "+2 (sidebar)"
+rects = [q.rect for q in ui.panels if q.visible]
+assert not [(a, b) for i, a in enumerate(rects) for b in rects[i + 1:] if U.clip_rect(a, b)]  # still no overlap
+vs.target = obj
+
 # the tool never leaves handlers / panels behind: errors, Blender cancelling it, closed area
 import types  # noqa: E402
 F = type("F", (), {k: v for k, v in vd.VOXELDRAW_OT_start.__dict__.items() if callable(v)})
