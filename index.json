@@ -1,0 +1,35 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "voxel_draw",
+      "name": "VoxelDraw",
+      "tagline": "MagicaVoxel-style voxel drawing with palette and brushes",
+      "version": "2.10.0",
+      "type": "add-on",
+      "maintainer": "Marclo",
+      "license": [
+        "SPDX:MIT"
+      ],
+      "blender_version_min": "5.0.0",
+      "website": "https://github.com/lmbmnl/BlenderMagicVoxel",
+      "copyright": [
+        "2026 lmbmnl",
+        "2020 Sreeraj R"
+      ],
+      "permissions": {
+        "files": "Import/export MagicaVoxel .vox files and load palette images"
+      },
+      "tags": [
+        "3D View",
+        "Mesh",
+        "Modeling"
+      ],
+      "archive_url": "./voxel_draw-2.10.0.zip",
+      "archive_size": 53848,
+      "archive_hash": "sha256:e58c0d145d846d6b7138aae6d450d326b4e92300eb270fdd62737f715a5a3626"
+    }
+  ]
+}
