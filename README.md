@@ -10,6 +10,10 @@ MagicaVoxel-style voxel editor inside Blender 5.x: draw coloured voxels directly
   first voxel (spawned on the 3D cursor), or across the model centre when the size limit is on
 - Placement preview with a thick outline, translucent fill and see-through hint
 - Select, move with a snapped gizmo, rotate, flip, mirror, duplicate, copy / paste
+- Selection (Select tool, 5): drag a rectangle to select the voxels you see (Surface on), click
+  to pick a voxel, every voxel of its colour (Colour) or the connected ones (Linked); Shift adds,
+  Ctrl removes, "Active colour" selects the active palette colour. Surface off also takes the
+  hidden / inner voxels (needed to move a solid model as a whole)
 - Blender's proportional editing (header icon / O, falloff menu, size, Connected, Projected) when
   moving a selection: G, gizmo, arrows; Stretch keeps the model solid (no gaps)
 - Rotate gizmo: drag a ring around the selection in 45° steps (90° steps exact, 45° approximated)

@@ -564,6 +564,82 @@ assert vd._hist["obj"] == b.name and len(vd._hist["undo"]) == 1
 assert vd.request_session(ctx, "") and vs.target not in (b, c) and len(started) == 2
 del vd._start_tool
 
+# --- selection: only what you see, by colour, linked, clearly drawn
+from mathutils import Matrix  # noqa: E402
+cube = {(x, y, z): (2 if z == 2 else 3) for x in range(3) for y in range(3) for z in range(3)}
+top = {c for c in cube if c[2] == 2}
+assert len(vd.exposed_cells(cube, cube)) == 26  # the centre voxel has no empty side
+assert vd.visible_cells(cube, cube, toward=np.array([0.0, 0.0, 1.0])) == top  # orthographic from above
+assert vd.visible_cells(cube, cube, eye=np.array([1.5, 1.5, 30.0])) == top  # perspective from above
+assert len(vd.visible_cells(cube, cube, eye=np.array([20.0, 20.0, 20.0]))) == 19  # three sides of the cube
+hidden = {(0, 0, 0): 1, (0, 0, 5): 1}
+assert vd.visible_cells(hidden, hidden, toward=np.array([0.0, 0.0, 1.0])) == {(0, 0, 5)}
+assert vd.visible_cells(hidden, hidden, toward=np.array([1.0, 0.0, 0.0])) == set(hidden)
+assert vd.pick_cells(cube, (0, 0, 0), 'VOXEL', True) == {(0, 0, 0)}
+assert vd.pick_cells(cube, (0, 0, 0), 'COLOR', False) == set(cube) - top  # colour 3, centre included
+assert vd.pick_cells(cube, (0, 0, 0), 'COLOR', True) == set(cube) - top - {(1, 1, 1)}
+assert vd.pick_cells(cube, (0, 0, 0), 'LINKED', True) == set(cube) - {(1, 1, 1)}
+assert vd.pick_cells(cube, (9, 9, 9), 'COLOR', True) == set()
+
+# rectangle in the tool: orthographic view from above, 200 x 200 px, everything inside it
+S = F()
+S.cells, S.size, S.rev = dict(cube), 1.0, 0
+S._sync = lambda o: None
+view = types.SimpleNamespace(perspective_matrix=Matrix.Diagonal((0.1, 0.1, -0.1, 1.0)),
+                             view_matrix=Matrix.Identity(4), is_perspective=False)
+reg = types.SimpleNamespace(x=0, y=0, width=200, height=200, data=view)
+fake_obj = types.SimpleNamespace(matrix_world=Matrix.Identity(4))
+release = types.SimpleNamespace(mouse_x=190, mouse_y=190)
+vs.select_surface = True
+vd._sel.clear()
+S.sel_press = (5, 5, 'SET', reg)
+S._select_end(ctx, release, fake_obj)
+assert vd._sel == top, sorted(vd._sel)  # only the top layer: the rest is hidden under it
+vs.select_surface = False
+S.sel_press = (5, 5, 'SET', reg)
+S._select_end(ctx, release, fake_obj)
+assert vd._sel == set(cube)  # Surface off: everything in the rectangle, as before
+vs.select_surface = True
+
+# click: Colour mode picks the colour of the voxel under the mouse; Shift adds, Ctrl removes
+S._hit = lambda o, d: ((0, 0, 0), (0, 0, -1))
+S._ray = lambda r, e, o: (None, None)
+click = types.SimpleNamespace(mouse_x=5, mouse_y=5)
+vs.select_by = 'COLOR'
+S.sel_press = (5, 5, 'SET', reg)
+S._select_end(ctx, click, fake_obj)
+assert vd._sel == set(cube) - top - {(1, 1, 1)}
+vs.select_by = 'VOXEL'
+S._hit = lambda o, d: ((1, 1, 2), (0, 0, 1))
+S.sel_press = (5, 5, 'ADD', reg)
+S._select_end(ctx, click, fake_obj)
+assert (1, 1, 2) in vd._sel
+S.sel_press = (5, 5, 'SUB', reg)
+S._select_end(ctx, click, fake_obj)
+assert (1, 1, 2) not in vd._sel
+
+# preview while hovering in Colour mode: what the click would select (large picks: one voxel)
+vs.mode, vs.select_by = 'SELECT', 'COLOR'
+assert set(S._stroke_cells(vs, 'SELECT', None, None)) == top  # (1, 1, 2) has colour 2
+real_max = vd.PREVIEW_MAX
+vd.PREVIEW_MAX = 3
+S.pick_key = None
+assert S._stroke_cells(vs, 'SELECT', None, None) == [(1, 1, 2)]
+vd.PREVIEW_MAX = real_max
+vs.mode, vs.select_by = 'ATTACH', 'VOXEL'
+
+# Active colour (panel button / operator): the voxels of the active colour, surface only
+vd._sel.clear()
+vs.color_index = 2
+assert vd.selection_action(vs, cube, 'COLOR') == {} and vd._sel == top
+
+# the selection is drawn from cached geometry, rebuilt only when it changes
+g1 = vd._selection_geometry()
+assert vd._selection_geometry() is g1
+vd._sel.add((5, 5, 5))
+assert vd._selection_geometry() is not g1
+vd._sel.clear()
+
 # Confirm finishes only the current session
 vd.save_cells(vs.target, {(0, 0, 0): 1}, 1.0)
 assert bpy.ops.voxeldraw.confirm() == {'FINISHED'}

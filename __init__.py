@@ -455,6 +455,142 @@ def cells_in_rect(cells, mvp, size, width, height, rect):
     return {k for k, f in zip(keys, inside.tolist()) if f}
 
 
+_SIDES6 = np.array(((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)), np.int64)
+_KEY_OFF = 1 << 20
+
+
+def _cell_keys(arr):
+    """Integer cells (n, 3) -> one int64 each (21 bits per axis), for fast lookups."""
+    a = np.asarray(arr, np.int64).reshape(-1, 3) + _KEY_OFF
+    return (a[:, 0] << 42) | (a[:, 1] << 21) | a[:, 2]
+
+
+def _in_sorted(keys, table):
+    if not len(table):
+        return np.zeros(len(keys), bool)
+    i = np.minimum(np.searchsorted(table, keys), len(table) - 1)
+    return table[i] == keys
+
+
+def exposed_cells(cells, picked):
+    """The voxels of `picked` with at least one empty side: the surface of the model."""
+    if not picked:
+        return set()
+    table = np.sort(_cell_keys(list(cells)))
+    p = np.array(list(picked), np.int64).reshape(-1, 3)
+    out = np.zeros(len(p), bool)
+    for n in _SIDES6:
+        out |= ~_in_sorted(_cell_keys(p + n), table)
+    return set(map(tuple, p[out].tolist()))
+
+
+def _rays_clear(start, direction, limit, table, lo, hi):
+    """Grid walk (Amanatides-Woo) of all rays at once, in voxel units. True where the
+    ray leaves the box lo..hi or covers `limit` without entering an occupied cell."""
+    n = len(start)
+    clear = np.zeros(n, bool)
+    if not n:
+        return clear
+    cell = np.floor(start).astype(np.int64)
+    step = np.sign(direction).astype(np.int64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        inv = np.where(direction != 0, 1.0 / direction, np.inf)
+        t_max = np.where(step != 0, (cell + (step > 0) - start) * inv, np.inf)
+    t_delta = np.abs(inv)
+    alive = np.arange(n)
+    for _ in range(int((hi - lo).sum()) + 4):
+        if not len(alive):
+            break
+        tm = t_max[alive]
+        axis = np.argmin(tm, axis=1)
+        rows = np.arange(len(alive))
+        t = tm[rows, axis]
+        cell[alive, axis] += step[alive, axis]
+        t_max[alive, axis] += t_delta[alive, axis]
+        c = cell[alive]
+        out = (t > limit[alive]) | np.any((c < lo) | (c > hi), axis=1)
+        clear[alive[out]] = True
+        hit = ~out & _in_sorted(_cell_keys(c), table)
+        alive = alive[~out & ~hit]
+    return clear
+
+
+_FACE_SAMPLES = ((0.0, 0.0), (0.35, 0.35), (-0.35, 0.35), (0.35, -0.35), (-0.35, -0.35))
+
+
+def visible_cells(cells, candidates, eye=None, toward=None):
+    """The voxels of `candidates` you can see: one of their faces turned to the view
+    has a clear line to the eye (perspective, `eye` in voxel units) or along
+    `toward` (orthographic, unit vector pointing at the viewer). A face is tried at
+    its centre first, then near its corners."""
+    if not candidates:
+        return set()
+    table = np.sort(_cell_keys(list(cells)))
+    allc = np.array(list(cells), np.int64).reshape(-1, 3)
+    lo, hi = allc.min(0) - 1, allc.max(0) + 1
+    cand = np.array(list(candidates), np.int64).reshape(-1, 3)
+    free_side = np.zeros(len(cand), bool)  # inner voxels can never be seen: skip them
+    for n in _SIDES6:
+        free_side |= ~_in_sorted(_cell_keys(cand + n), table)
+    cand = cand[free_side]
+    seen = np.zeros(len(cand), bool)
+    for su, sv in _FACE_SAMPLES:
+        todo = np.flatnonzero(~seen)
+        if not len(todo):
+            break
+        starts, owners = [], []
+        for n in _SIDES6:
+            c = cand[todo]
+            free = ~_in_sorted(_cell_keys(c + n), table)
+            a = int(np.flatnonzero(n)[0])
+            u, v = [i for i in range(3) if i != a]
+            p = c + 0.5 + n * 0.5
+            p[:, u] += su
+            p[:, v] += sv
+            p = p + n * 1e-4  # just outside the face, in the empty cell
+            facing = (np.dot(eye - p, n) > 0) if eye is not None else np.full(len(p), float(np.dot(toward, n)) > 0)
+            keep = free & facing
+            starts.append(p[keep])
+            owners.append(todo[keep])
+        start, owner = np.concatenate(starts), np.concatenate(owners)
+        if eye is not None:
+            d = eye - start
+            limit = np.linalg.norm(d, axis=1)
+            d = d / np.maximum(limit, 1e-12)[:, None]
+        else:
+            d = np.tile(toward, (len(start), 1))
+            limit = np.full(len(start), np.inf)
+        ok = _rays_clear(start, d, limit, table, lo, hi)
+        seen[owner[ok]] = True
+    return set(map(tuple, cand[seen].tolist()))
+
+
+def pick_cells(cells, cell, by, surface):
+    """What a click on `cell` selects: the voxel, every voxel of its colour, or the
+    voxels connected to it; `surface` keeps only those with an empty side."""
+    if cell not in cells:
+        return set()
+    if by == 'COLOR':
+        col = cells[cell]
+        picked = {c for c, k in cells.items() if k == col}
+    elif by == 'LINKED':
+        picked = flood(cells, cell)
+    else:
+        return {cell}
+    return exposed_cells(cells, picked) if surface else picked
+
+
+def view_in_grid(rv3d, obj, size):
+    """(eye, toward) in voxel units of obj: the eye for a perspective view, the
+    direction to the viewer for an orthographic one."""
+    inv = obj.matrix_world.inverted_safe()
+    view = rv3d.view_matrix.inverted()
+    if rv3d.is_perspective:
+        return np.array(inv @ view.translation) / size, None
+    d = (inv.to_3x3() @ (view.to_3x3() @ Vector((0, 0, 1)))).normalized()
+    return None, np.array(d)
+
+
 def vox_bytes(cells, pal):
     """MagicaVoxel .vox (one model, shifted to start at 0) from cells + (256,3) sRGB palette."""
     lo, hi = bounds_of(cells)
@@ -872,6 +1008,12 @@ MAX_HISTORY = 100
 CUBE_CORNERS = np.array([(x, y, z) for z in (0, 1) for y in (0, 1) for x in (0, 1)], np.float32)
 CUBE_LINES = np.array(((0, 1), (0, 2), (1, 3), (2, 3), (4, 5), (4, 6),
                        (5, 7), (6, 7), (0, 4), (1, 5), (2, 6), (3, 7)), np.int32)
+PREVIEW_MAX = 4000  # Colour / Linked pick previews up to this many voxels
+SELECT_BY_ITEMS = [
+    ("VOXEL", "Voxel", "Click: the voxel under the mouse. Drag: a rectangle"),
+    ("COLOR", "Colour", "Click: every voxel of that colour. Drag: a rectangle"),
+    ("LINKED", "Linked", "Click: the voxels connected to it. Drag: a rectangle"),
+]
 MODE_KEYS = {'ONE': 'ATTACH', 'TWO': 'ERASE', 'THREE': 'MOVE', 'FOUR': 'PAINT', 'FIVE': 'SELECT'}
 AXIS_KEYS = {'X': 0, 'Y': 1, 'Z': 2}
 AXIS_COLORS = ((0.95, 0.25, 0.3, 1), (0.55, 0.85, 0.2, 1), (0.25, 0.55, 1, 1))
@@ -965,6 +1107,11 @@ def selection_action(vs, cells, action, axis=0, ccw=False, delta=(0, 0, 0)):
         return {}
     if action == 'NONE':
         _sel.clear()
+        return {}
+    if action == 'COLOR':  # every voxel of the active colour
+        picked = {c for c, k in cells.items() if k == vs.color_index}
+        _sel.clear()
+        _sel.update(exposed_cells(cells, picked) if vs.select_surface else picked)
         return {}
     if not sel:
         return {}
@@ -1371,6 +1518,12 @@ class VoxelSettings(bpy.types.PropertyGroup):
                     "grows on what it just added (original 'tentacle' behaviour), "
                     "Erase digs through to the voxels behind")
     mode: bpy.props.EnumProperty(name="Mode", items=MODE_ITEMS, default='ATTACH', update=_redraw)
+    select_by: bpy.props.EnumProperty(name="Click Selects", items=SELECT_BY_ITEMS, default='VOXEL',
+                                      update=_redraw)
+    select_surface: bpy.props.BoolProperty(
+        name="Surface Only", default=True, update=_redraw,
+        description="Rectangle: only the voxels you see. Colour / Linked / Active colour: only voxels "
+                    "with an empty side. Off: also hidden and inner voxels")
     brush: bpy.props.EnumProperty(name="Brush", items=BRUSH_ITEMS, default='SHAPE', update=_redraw,
                                   description="Brush type (B cycles)")
     shape: bpy.props.EnumProperty(
@@ -1547,6 +1700,17 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
     def _stroke_cells(self, vs, mode, o, d):
         """_brush_cells without the live mirror."""
         brush = vs.brush
+        if mode == 'SELECT' and vs.select_by != 'VOXEL':  # preview what the click selects
+            hit = self._hit(o, d)
+            if not hit:
+                return None
+            key = (hit[0] if vs.select_by == 'LINKED' else self.cells.get(hit[0]),
+                   vs.select_by, vs.select_surface, self.rev)
+            if getattr(self, "pick_key", None) != key:
+                self.pick_key = key
+                self.pick_preview = pick_cells(self.cells, hit[0], vs.select_by, vs.select_surface)
+            # a very large pick previews as the voxel under the mouse (the ghost is redrawn often)
+            return list(self.pick_preview) if len(self.pick_preview) <= PREVIEW_MAX else [hit[0]]
         if mode == 'SELECT' or brush == 'FILL':
             hit = self._hit(o, d)
             return [hit[0]] if hit else None
@@ -1722,14 +1886,17 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
         self.sel_press = None
         _state["rect"] = None
         self._sync(obj)
+        vs = context.scene.voxel_settings
         x1, y1 = event.mouse_x - region.x, event.mouse_y - region.y
-        if abs(x1 - x0) + abs(y1 - y0) > 4:
+        if abs(x1 - x0) + abs(y1 - y0) > 4:  # rectangle: the voxels inside it (that you see)
             mvp = region.data.perspective_matrix @ obj.matrix_world
             picked = cells_in_rect(self.cells, mvp, self.size, region.width, region.height,
                                    (x0, y0, x1, y1))
-        else:
+            if vs.select_surface:
+                picked = visible_cells(self.cells, picked, *view_in_grid(region.data, obj, self.size))
+        else:  # click: the voxel / its colour / what is connected to it
             hit = self._hit(*self._ray(region, event, obj))
-            picked = {hit[0]} if hit else set()
+            picked = pick_cells(self.cells, hit[0], vs.select_by, vs.select_surface) if hit else set()
         if op == 'SET':
             _sel.clear()
         if op == 'SUB':
@@ -1988,11 +2155,8 @@ class VOXELDRAW_OT_start(bpy.types.Operator):
             if hit:
                 if not shift:
                     _sel.clear()
-                if t == 'L':
-                    _sel.update(flood(self.cells, hit[0]))
-                else:
-                    col = self.cells[hit[0]]
-                    _sel.update(c for c, k in self.cells.items() if k == col)
+                _sel.update(pick_cells(self.cells, hit[0], 'LINKED' if t == 'L' else 'COLOR',
+                                       vs.select_surface))
             return True
         if t == 'C' and ctrl:
             selection_action(vs, self.cells, 'COPY')
@@ -2355,7 +2519,8 @@ class VOXELDRAW_OT_selection(_SessionOp, bpy.types.Operator):
         ("ALL", "Select All", ""), ("NONE", "Select None", ""), ("DELETE", "Delete", ""),
         ("PAINT", "Paint", "Recolour the selection with the active colour"),
         ("COPY", "Copy", ""), ("ROTATE", "Rotate 90°", ""), ("FLIP", "Flip", ""),
-        ("MIRROR", "Mirror", "Mirrored copy across the plane of the first voxel")])
+        ("MIRROR", "Mirror", "Mirrored copy across the plane of the first voxel"),
+        ("COLOR", "Select Colour", "Select the voxels of the active colour")])
     axis: bpy.props.IntProperty(min=0, max=2)
 
     def execute(self, context):
@@ -2785,14 +2950,6 @@ def _lines(shader, pts, color, idx=None):
     batch.draw(shader)
 
 
-def _draw_cubes(shader, cells, size, color):
-    p = np.array(list(cells), np.float32).reshape(-1, 3)
-    if len(p):
-        pts = ((p[:, None, :] + CUBE_CORNERS) * size).reshape(-1, 3)
-        idx = (np.arange(len(p), dtype=np.int32)[:, None, None] * 8 + CUBE_LINES).reshape(-1, 2)
-        _lines(shader, pts, color, idx)
-
-
 def _toward_viewer(rv3d, obj, pts, amount):
     """Move object-space points `amount` toward the viewer: a depth bias, so ghost
     edges lying on voxel edges are not half hidden by the faces next to them."""
@@ -2806,10 +2963,22 @@ def _toward_viewer(rv3d, obj, pts, amount):
     return pts + d / np.maximum(n, 1e-9) * amount
 
 
-def _draw_ghost(rv3d, obj, cells, size, color, xray=False):
+SEL_COLOR = (1.0, 0.55, 0.0, 1.0)
+_sel_geometry = {"key": None, "geometry": None}
+
+
+def _selection_geometry():
+    """ghost_geometry of the selection, rebuilt only when the selection changes."""
+    key = hash(frozenset(_sel))
+    if _sel_geometry["key"] != key:
+        _sel_geometry.update(key=key, geometry=ghost_geometry(_sel))
+    return _sel_geometry["geometry"]
+
+
+def _draw_ghost(rv3d, obj, cells, size, color, xray=False, geometry=None):
     """Voxels about to be placed / erased / painted / moved: translucent fill,
     see-through hint, thick outline with a contrasting halo."""
-    tris, segs = ghost_geometry(cells)
+    tris, segs = geometry if geometry is not None else ghost_geometry(cells)
     if not len(segs):
         return
     segs = _toward_viewer(rv3d, obj, segs * size, 0.02 * size)
@@ -2907,9 +3076,9 @@ def _draw_preview():
         batch.draw(shader)
         _lines(shader, quad, (*AXIS_COLORS[a][:3], 0.6), ((0, 1), (1, 2), (2, 3), (3, 0)))
 
-    if _sel:  # placed voxels: thin outline
-        _draw_cubes(shader, _sel, size, (1, 0.55, 0, 1))
     rv3d = context.region_data
+    if _sel:  # selected voxels: orange fill + thick outline (cached geometry)
+        _draw_ghost(rv3d, obj, _sel, size, SEL_COLOR, geometry=_selection_geometry())
     cells = _state["hover"]
     if cells:
         if _state["mode"] == 'ERASE':
@@ -3328,6 +3497,13 @@ def build_viewport_ui():
 
     selection = vd_ui.Panel("selection", "Selection", Col(
         L(lambda: f"{len(_sel)} selected    clipboard {len(_clip)}", small=True, dim=True, align="CENTER"),
+        Row(L("Click", small=True, dim=True),
+            *[radio("select_by", k, label, tip=tip) for k, label, tip in SELECT_BY_ITEMS],
+            toggle("select_surface", "Surface", ICONS['bounds'],
+                   "Rectangle: only the voxels you see. Colour / Linked / Active colour: only voxels\n"
+                   "with an empty side. Off: hidden and inner voxels too (needed to move a solid model)"),
+            op_button("Active colour", ICONS['palette'], sel_op('COLOR'),
+                      "Select every voxel of the active palette colour")),
         Row(op_button("All", ICONS['all'], sel_op('ALL'), "Select all (A)"),
             op_button("None", ICONS['none'], sel_op('NONE'), "Select none (Alt+A)", enabled=has_sel),
             op_button("Delete", ICONS['trash'], sel_op('DELETE'), "Delete the selection (X)", enabled=has_sel),

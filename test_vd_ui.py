@@ -223,6 +223,15 @@ assert vs.mirror_live
 mz = find(lambda w: isinstance(w, U.Button) and w.text == "Z" and w.on_click.__name__ == "flip")
 click(ui, mz)
 assert tuple(vs.mirror) == (True, False, True)
+click(ui, find(lambda w: isinstance(w, U.Button) and w.text == "Colour"))  # Selection panel
+assert vs.select_by == 'COLOR'
+surface = find(lambda w: isinstance(w, U.Button) and w.text == "Surface")
+assert vs.select_surface and U._val(surface.active)
+click(ui, surface)
+assert not vs.select_surface
+click(ui, surface)
+vs.select_by = 'VOXEL'
+assert find(lambda w: isinstance(w, U.Button) and w.text == "Active colour").enabled
 pal = find(lambda w: isinstance(w, U.ColorGrid))
 gx, gy, gw, gh = pal.rect
 click_at = (gx + 20 * 3 + 5, gy + gh - 5)
